@@ -31,7 +31,6 @@ def list_workbench_targets(port):
         sys.exit(1)
     return windows
 
-
 async def get_window_sizes(ws_url):
     async with websockets.connect(ws_url, max_size=2**20) as ws:
         await ws.send(json.dumps({"id": 0, "method": "Runtime.enable"}))
@@ -153,22 +152,8 @@ async def read_current(ws):
     """))
 
 
-async def main():
-    if not os.path.isfile(CONFIG_PATH):
-        print(f"No saved sizes at {CONFIG_PATH}. Run save-panel-bar-sizes.py first.")
-        sys.exit(1)
-
-    with open(CONFIG_PATH) as f:
-        target = json.load(f)
-
-    t_sidebar = target["sidebar"]["width"]
-    t_panel = target["panel"]["width"]
-    saved_title = target.get("_window_title", None)
-
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9333
-    ws_url = await pick_target(port, saved_title)
-    print(f"Target: sidebar={t_sidebar}px  panel={t_panel}px")
-
+async def restore_window(ws_url, t_sidebar, t_panel, label=""):
+    prefix = f"[{label}] " if label else ""
     async with websockets.connect(ws_url, max_size=2**20) as ws:
         await ws.send(json.dumps({"id": 0, "method": "Runtime.enable"}))
         for _ in range(200):
@@ -181,22 +166,52 @@ async def main():
             smap.setdefault("editor_panel", 1)
 
         cur = await read_current(ws)
-        print(f"  current: sb={cur['sidebar']} panel={cur['panel']} editor={cur['editor']}")
+        print(f"{prefix}current: sb={cur['sidebar']} panel={cur['panel']} editor={cur['editor']}")
 
         dx_p = cur["panel"] - t_panel
         if dx_p != 0:
-            print(f"  dragging panel sash by {dx_p:+d}")
+            print(f"{prefix} dragging panel sash by {dx_p:+d}")
             await drag_sash(ws, smap["editor_panel"], dx_p)
 
         dx_s = t_sidebar - cur["sidebar"]
         if dx_s != 0:
-            print(f"  dragging sidebar sash by {dx_s:+d}")
+            print(f"{prefix} dragging sidebar sash by {dx_s:+d}")
             await drag_sash(ws, smap["sidebar_editor"], dx_s)
 
         final = await read_current(ws)
         ok = final["sidebar"] == t_sidebar and final["panel"] == t_panel
-        print(f"  final:   sb={final['sidebar']} panel={final['panel']} editor={final['editor']}  "
+        print(f"{prefix}final:   sb={final['sidebar']} panel={final['panel']} editor={final['editor']}  "
               f"{'OK' if ok else 'MISSING'}")
+
+
+async def main():
+    if not os.path.isfile(CONFIG_PATH):
+        print(f"No saved sizes at {CONFIG_PATH}. Run save-panel-bar-sizes.py first.")
+        sys.exit(1)
+
+    with open(CONFIG_PATH) as f:
+        target = json.load(f)
+
+    t_sidebar = target["sidebar"]["width"]
+    t_panel = target["panel"]["width"]
+    saved_title = target.get("_window_title", None)
+
+    all_flag = "--all" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    port = int(args[0]) if args else 9333
+
+    if all_flag:
+        windows = list_workbench_targets(port)
+        print(f"Restoring {len(windows)} window(s) to sidebar={t_sidebar}px  panel={t_panel}px\n")
+        for idx, t in windows:
+            title = t.get("title", "unknown")
+            print(f"[{idx}] {title}")
+            await restore_window(t["webSocketDebuggerUrl"], t_sidebar, t_panel, label=f"{idx}")
+            print()
+    else:
+        ws_url = await pick_target(port, saved_title)
+        print(f"Target: sidebar={t_sidebar}px  panel={t_panel}px")
+        await restore_window(ws_url, t_sidebar, t_panel)
 
 
 if __name__ == "__main__":
