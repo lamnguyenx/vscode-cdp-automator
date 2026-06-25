@@ -1,16 +1,10 @@
-.PHONY: windows-resizer panel-resizer clean
+.PHONY: vscode-ui-resizer clean
 
-windows-resizer: windows-resizer/windows-resizer.exe
+vscode-ui-resizer: vscode-ui-resizer/vscode-ui-resizer.exe
 
-windows-resizer/windows-resizer.exe: windows-resizer/windows-resizer.swift
-	swiftc -o windows-resizer/windows-resizer.exe windows-resizer/windows-resizer.swift
-	@echo "Built windows-resizer/windows-resizer.exe"
-
-panel-resizer: panel-resizer/panel-resizer.exe
-
-panel-resizer/panel-resizer.exe: panel-resizer/panel-resizer.swift
-	swiftc -o panel-resizer/panel-resizer.exe panel-resizer/panel-resizer.swift
-	@echo "Built panel-resizer/panel-resizer.exe"
+vscode-ui-resizer/vscode-ui-resizer.exe: vscode-ui-resizer/vscode-ui-resizer.swift
+	swiftc -o vscode-ui-resizer/vscode-ui-resizer.exe vscode-ui-resizer/vscode-ui-resizer.swift
+	@echo "Built vscode-ui-resizer/vscode-ui-resizer.exe"
 
 clean:
-	rm -f windows-resizer/windows-resizer.exe panel-resizer/panel-resizer.exe
+	rm -f vscode-ui-resizer/vscode-ui-resizer.exe windows-resizer/windows-resizer.exe panel-resizer/panel-resizer.exe
