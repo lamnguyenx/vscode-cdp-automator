@@ -255,12 +255,15 @@ func wsSend(_ task: URLSessionWebSocketTask, _ text: String, waitForId id: Int? 
         return wsRecv(task)
     }
 
+    let needle = "\"id\":\(mid)"
     for _ in 0..<500 {
         let raw = wsRecv(task)
+        if !raw.contains(needle) { continue }
         guard let data = raw.data(using: .utf8),
-              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              dict["id"] as? Int == mid
         else { continue }
-        if dict["id"] as? Int == mid { return raw }
+        return raw
     }
     return "{}"
 }
@@ -534,7 +537,21 @@ func readCurrent(_ task: URLSessionWebSocketTask) -> [String: Int] {
     return dict
 }
 
-func solveSashMapping(_ task: URLSessionWebSocketTask) -> [String: Int] {
+func readPanelPosition(_ task: URLSessionWebSocketTask) -> String {
+    let raw = evalJS(task, """
+    (() => {
+        const el = document.querySelector('.part.panel');
+        if (!el) return 'none';
+        if (el.classList.contains('right')) return 'right';
+        if (el.classList.contains('left')) return 'left';
+        if (el.classList.contains('bottom')) return 'bottom';
+        return 'other';
+    })()
+    """)
+    return raw.trimmingCharacters(in: CharacterSet(charactersIn: "\"").union(.whitespacesAndNewlines))
+}
+
+func solveSashMappingHorizontal(_ task: URLSessionWebSocketTask) -> [String: Int] {
     let raw = evalJS(task, """
     (() => {
         const all = document.querySelectorAll('.monaco-grid-view .monaco-split-view2.horizontal .sash-container .monaco-sash.vertical:not(.disabled)');
@@ -554,14 +571,49 @@ func solveSashMapping(_ task: URLSessionWebSocketTask) -> [String: Int] {
                 if (r.width === 0 && r.height === 0) continue;
                 const dL = cx - r.right;
                 const dR = r.left - cx;
-                if (dL >= 0 && dL < bestL) { bestL = dL; leftName = name; }
-                if (dR >= 0 && dR < bestR) { bestR = dR; rightName = name; }
+                if (dL >= -0.5 && dL < bestL) { bestL = dL; leftName = name; }
+                if (dR >= -0.5 && dR < bestR) { bestR = dR; rightName = name; }
             }
             results.push({ idx: i, between: leftName + '|' + rightName, cx: Math.round(cx) });
         });
         return JSON.stringify(results);
     })()
     """)
+    return parseSashMappingResult(raw)
+}
+
+func solveSashMappingVertical(_ task: URLSessionWebSocketTask) -> [String: Int] {
+    let raw = evalJS(task, """
+    (() => {
+        const all = document.querySelectorAll('.monaco-grid-view .monaco-split-view2.vertical .sash-container .monaco-sash.horizontal:not(.disabled)');
+        const parts = ['sidebar', 'panel', 'editor', 'activitybar', 'auxiliarybar'];
+        const rects = {};
+        parts.forEach(p => {
+            const el = document.querySelector('.part.' + p);
+            if (el) rects[p] = el.getBoundingClientRect();
+        });
+        const results = [];
+        all.forEach((sash, i) => {
+            const b = sash.getBoundingClientRect();
+            const cy = b.top + b.height / 2;
+            let aboveName = '?', belowName = '?';
+            let bestA = Infinity, bestB = Infinity;
+            for (const [name, r] of Object.entries(rects)) {
+                if (r.width === 0 && r.height === 0) continue;
+                const dA = cy - r.bottom;
+                const dB = r.top - cy;
+                if (dA >= -0.5 && dA < bestA) { bestA = dA; aboveName = name; }
+                if (dB >= -0.5 && dB < bestB) { bestB = dB; belowName = name; }
+            }
+            results.push({ idx: i, between: aboveName + '|' + belowName, cy: Math.round(cy) });
+        });
+        return JSON.stringify(results);
+    })()
+    """)
+    return parseSashMappingResult(raw)
+}
+
+func parseSashMappingResult(_ raw: String) -> [String: Int] {
     var smap: [String: Int] = [:]
     guard let data = raw.data(using: .utf8),
           let mapping = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
@@ -574,13 +626,13 @@ func solveSashMapping(_ task: URLSessionWebSocketTask) -> [String: Int] {
     return smap
 }
 
-func dragSash(_ task: URLSessionWebSocketTask, sashIdx: Int, dx: Int) {
+func dragSashHorizontal(_ task: URLSessionWebSocketTask, sashIdx: Int, dx: Int) {
     guard dx != 0 else { return }
     _ = evalJS(task, """
     (() => {
         const all = document.querySelectorAll('.monaco-grid-view .monaco-split-view2.horizontal .sash-container .monaco-sash.vertical:not(.disabled)');
         const sash = all[\(sashIdx)];
-        if (!sash) return JSON.stringify({error:'no sash at \(sashIdx)'});
+        if (!sash) return JSON.stringify({error:'no sash at \(sashIdx)', count: all.length});
         const b = sash.getBoundingClientRect();
         const cx = b.left + b.width / 2;
         const cy = b.top + b.height / 2;
@@ -593,6 +645,25 @@ func dragSash(_ task: URLSessionWebSocketTask, sashIdx: Int, dx: Int) {
     """)
 }
 
+func dragSashVertical(_ task: URLSessionWebSocketTask, sashIdx: Int, dy: Int) {
+    guard dy != 0 else { return }
+    _ = evalJS(task, """
+    (() => {
+        const all = document.querySelectorAll('.monaco-grid-view .monaco-split-view2.vertical .sash-container .monaco-sash.horizontal:not(.disabled)');
+        const sash = all[\(sashIdx)];
+        if (!sash) return JSON.stringify({error:'no sash at \(sashIdx)', count: all.length});
+        const b = sash.getBoundingClientRect();
+        const cx = b.left + b.width / 2;
+        const cy = b.top + b.height / 2;
+        const w = document.defaultView;
+        sash.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, clientX: cx, clientY: cy, button: 0}));
+        w.dispatchEvent(new MouseEvent('mousemove',   {bubbles: true, clientX: cx, clientY: cy + \(dy), button: 0}));
+        w.dispatchEvent(new MouseEvent('mouseup',     {bubbles: true, clientX: cx, clientY: cy + \(dy), button: 0}));
+        return 'ok';
+    })()
+    """)
+}
+
 func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: String) {
     let prefix = label.isEmpty ? "" : "[\(label)] "
     guard let task = newWebSocket(wsUrl) else { return }
@@ -600,35 +671,88 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
 
     enableRuntime(task)
 
-    var smap = solveSashMapping(task)
-    if smap["sidebar_editor"] == nil { smap["sidebar_editor"] = 0 }
-    if smap["editor_panel"] == nil { smap["editor_panel"] = 1 }
+    let panelPos = readPanelPosition(task)
+
+    let isBottom = panelPos == "bottom"
+    let smap = isBottom ? solveSashMappingVertical(task) : solveSashMappingHorizontal(task)
+    var seIdx = smap["sidebar_editor"]
+    var epIdx = smap["editor_panel"]
+
+    if seIdx == nil { seIdx = 0 }
+    if epIdx == nil { epIdx = 1 }
+
+    if isBottom {
+        print("\(prefix)(panel at bottom — using vertical sashes)")
+    }
 
     let maxRetries = 5
     var ok = false
+    var consecutiveZeros = 0
     for attempt in 1...maxRetries {
         let cur = readCurrent(task)
         let sb = cur["sidebar"] ?? 0
-        let pn = cur["panel"] ?? 0
+        var pn = cur["panel"] ?? 0
         let ed = cur["editor"] ?? 0
 
-        let dx_p = pn - tPanel
-        let dx_s = tSidebar - sb
+        if sb == 0 && pn == 0 && ed == 0 {
+            consecutiveZeros += 1
+            if consecutiveZeros >= 3 {
+                print("\(prefix)workbench not ready (zero values), skipping")
+                return
+            }
+            print("\(prefix)workbench not ready (zero values), retrying...")
+            Thread.sleep(forTimeInterval: 0.5)
+            continue
+        }
+        consecutiveZeros = 0
 
         if attempt == 1 {
             print("\(prefix)current: sb=\(sb) panel=\(pn) editor=\(ed)")
         }
 
+        if !isBottom && pn == 0 && tPanel > 0 && smap["editor_panel"] == nil {
+            print("\(prefix)panel is collapsed (width=0) and no editor|panel sash found — expand panel first, then re-run")
+            return
+        }
+        if isBottom && pn == 0 && tPanel > 0 && smap["editor_panel"] == nil {
+            print("\(prefix)panel is collapsed (height=0) and no editor|panel sash found — expand panel first, then re-run")
+            return
+        }
+
+        let dx_p: Int
+        let dx_s: Int
+
+        if isBottom {
+            let rawH = evalJS(task, """
+            (() => {
+                const el = document.querySelector('.part.panel');
+                if (!el) return 0;
+                return Math.round(el.getBoundingClientRect().height);
+            })()
+            """)
+            let ph = Int(rawH) ?? 0
+            pn = ph
+            dx_p = pn - tPanel
+            dx_s = tSidebar - sb
+        } else {
+            dx_p = pn - tPanel
+            dx_s = tSidebar - sb
+        }
+
         if dx_p != 0 {
             let sign = dx_p > 0 ? "+" : ""
             print("\(prefix) dragging panel sash by \(sign)\(dx_p)")
-            dragSash(task, sashIdx: smap["editor_panel"]!, dx: dx_p)
+            if isBottom {
+                dragSashVertical(task, sashIdx: epIdx!, dy: dx_p)
+            } else {
+                dragSashHorizontal(task, sashIdx: epIdx!, dx: dx_p)
+            }
         }
 
         if dx_s != 0 {
             let sign = dx_s > 0 ? "+" : ""
             print("\(prefix) dragging sidebar sash by \(sign)\(dx_s)")
-            dragSash(task, sashIdx: smap["sidebar_editor"]!, dx: dx_s)
+            dragSashHorizontal(task, sashIdx: seIdx!, dx: dx_s)
         }
 
         if dx_p == 0 && dx_s == 0 {
@@ -645,11 +769,24 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
 
         let final = readCurrent(task)
         let fsb = final["sidebar"] ?? 0
-        let fpn = final["panel"] ?? 0
+        var fpn = final["panel"] ?? 0
         let fed = final["editor"] ?? 0
+
+        if isBottom {
+            let rawH = evalJS(task, """
+            (() => {
+                const el = document.querySelector('.part.panel');
+                if (!el) return 0;
+                return Math.round(el.getBoundingClientRect().height);
+            })()
+            """)
+            fpn = Int(rawH) ?? 0
+        }
+
         ok = fsb == tSidebar && fpn == tPanel
         let status = ok ? "OK" : "RETRY"
-        print("\(prefix)final:   sb=\(fsb) panel=\(fpn) editor=\(fed)  [\(status)]")
+        let dimLabel = isBottom ? "h" : ""
+        print("\(prefix)final:   sb=\(fsb) panel\(dimLabel)=\(fpn) editor\(dimLabel)=\(fed)  [\(status)]")
 
         if ok { break }
     }
@@ -671,10 +808,19 @@ func cmdRestoreLayout(port: Int) {
     else { exit(1) }
 
     let tSidebar = sidebar["width"] as? Int ?? 0
-    let tPanel = panel["width"] as? Int ?? 0
+    let savedPanelPos = target["panel_position"] as? String ?? ""
+    let tPanel: Int
+    let panelDimLabel: String
+    if savedPanelPos == "bottom" || savedPanelPos == "top" {
+        tPanel = panel["height"] as? Int ?? 0
+        panelDimLabel = "h"
+    } else {
+        tPanel = panel["width"] as? Int ?? 0
+        panelDimLabel = ""
+    }
 
     let windows = fetchTargets(port: port)
-    print("Restoring \(windows.count) window(s) to sidebar=\(tSidebar)px  panel=\(tPanel)px\n")
+    print("Restoring \(windows.count) window(s) to sidebar=\(tSidebar)px  panel=\(tPanel)px\(panelDimLabel)\n")
 
     for (idx, t) in windows.enumerated() {
         guard let wsUrl = t["webSocketDebuggerUrl"] as? String else { continue }

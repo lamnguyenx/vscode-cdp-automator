@@ -2,7 +2,7 @@
 
 ## Problem
 
-VS Code extensions **cannot** programmatically get or set sidebar/panel pixel sizes. No API exists for this. But when VS Code is launched with `--remote-debugging-port=9222`, Chrome DevTools Protocol (CDP) gives full JavaScript evaluation power in the renderer, and you can simulate mouse drags on the internal `Sash` splitter elements.
+VS Code extensions **cannot** programmatically get or set sidebar/panel pixel sizes. No API exists for this. But when VS Code is launched with `--remote-debugging-port=9333`, Chrome DevTools Protocol (CDP) gives full JavaScript evaluation power in the renderer, and you can simulate mouse drags on the internal `Sash` splitter elements.
 
 ## Setup
 
@@ -77,6 +77,16 @@ Always use:
 document.querySelectorAll(
   '.monaco-grid-view .monaco-split-view2.horizontal .sash-container .monaco-sash.vertical:not(.disabled)'
 );
+```
+
+### THE BUG: Floating-Point Precision in Sash-Part Mapping
+
+`getBoundingClientRect()` returns sub-pixel floating-point values (e.g. `1674.619140625`). When a sash center (`cx`) and a part edge (`.right` / `.left`) are visually on the same pixel boundary, their computed difference (`dL = cx - r.right` or `dR = r.left - cx`) can be a tiny negative number like `-0.0049`. The `>= 0` check then fails, and the algorithm picks the wrong neighbor (e.g. `sidebar|panel` instead of `editor|panel`).
+
+**Fix:** Add a `-0.5` tolerance:
+```js
+if (dL >= -0.5 && dL < bestL) { bestL = dL; leftName = name; }
+if (dR >= -0.5 && dR < bestR) { bestR = dR; rightName = name; }
 ```
 
 ## CDP Drag JavaScript
