@@ -462,8 +462,6 @@ func cmdSaveLayout(port: Int) {
     let title = (t["title"] as? String) ?? "unknown"
     print("Saving from: \(title)")
 
-    enableRuntime(task)
-
     let raw = evalJS(task, """
     (() => {
         const r = {};
@@ -669,8 +667,6 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
     guard let task = newWebSocket(wsUrl) else { return }
     defer { task.cancel(with: .normalClosure, reason: nil) }
 
-    enableRuntime(task)
-
     let panelPos = readPanelPosition(task)
 
     let isBottom = panelPos == "bottom"
@@ -833,23 +829,35 @@ func cmdRestoreLayout(port: Int) {
 
 // MARK: - Save All
 
+func runSubCommand(_ args: [String]) -> Int32 {
+    fflush(stdout)
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    proc.arguments = args
+    try? proc.run()
+    proc.waitUntilExit()
+    return proc.terminationStatus
+}
+
 func cmdSaveAll(port: Int) {
     print("=== save-layout ===")
-    cmdSaveLayout(port: port)
+    let lr = runSubCommand(["save-layout", String(port)])
     print("")
     print("=== save-win ===")
-    cmdSaveWin()
+    let wr = runSubCommand(["save-win"])
+    if lr != 0 || wr != 0 { exit(1) }
 }
 
 // MARK: - Restore All
 
 func cmdRestoreAll(port: Int) {
     print("=== restore-win ===")
-    cmdRestoreWin()
+    let wr = runSubCommand(["restore-win"])
     print("")
     Thread.sleep(forTimeInterval: 0.5)
     print("=== restore-layout ===")
-    cmdRestoreLayout(port: port)
+    let lr = runSubCommand(["restore-layout", String(port)])
+    if wr != 0 || lr != 0 { exit(1) }
 }
 
 // MARK: - List Displays

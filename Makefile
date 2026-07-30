@@ -8,3 +8,4 @@ vscode-ui-resizer/vscode-ui-resizer.exe: vscode-ui-resizer/vscode-ui-resizer.swi
 
 clean:
 	rm -f vscode-ui-resizer/vscode-ui-resizer.exe windows-resizer/windows-resizer.exe panel-resizer/panel-resizer.exe
+
