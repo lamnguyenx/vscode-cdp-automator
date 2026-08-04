@@ -133,6 +133,84 @@ func describeScreen(containing point: CGPoint) -> (frame: String, relativeX: Dou
     return ("off-screen", Double(point.x), Double(point.y))
 }
 
+// MARK: - Display Fingerprint
+
+func displayFingerprint() -> String {
+    struct DisplayLine {
+        let x: Int
+        let y: Int
+        let w: Int
+        let h: Int
+        let rot: Int
+        let name: String
+        let isMain: Bool
+    }
+
+    let mainScreen = NSScreen.screens.first
+    var displays: [DisplayLine] = []
+
+    for screen in NSScreen.screens {
+        let frame = screen.frame
+        let name = screen.localizedName.isEmpty ? "Display" : screen.localizedName
+        let isMain = (screen == mainScreen)
+
+        var rotation = 0
+        var physW = Int(frame.width)
+        var physH = Int(frame.height)
+
+        if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
+            rotation = Int(CGDisplayRotation(screenNumber))
+            if let mode = CGDisplayCopyDisplayMode(screenNumber) {
+                physW = mode.pixelWidth
+                physH = mode.pixelHeight
+            }
+        }
+
+        if rotation == 90 || rotation == 270 {
+            swap(&physW, &physH)
+        }
+
+        displays.append(DisplayLine(
+            x: Int(frame.origin.x),
+            y: Int(frame.origin.y),
+            w: physW,
+            h: physH,
+            rot: rotation,
+            name: name,
+            isMain: isMain
+        ))
+    }
+
+    displays.sort { $0.x < $1.x || ($0.x == $1.x && $0.y < $1.y) }
+
+    return displays.map { d in
+        let xStr = String(format: "%5d", d.x)
+        let yStr = String(format: "%3d", d.y)
+        let marker = d.isMain ? "*" : " "
+        return "[\(xStr),\(yStr)] \(d.w)x\(d.h) \(d.rot)°  \(d.name)\(marker)"
+    }.joined(separator: "\n")
+}
+
+// MARK: - Devhost Detection
+
+func isDevHostProcess(pid: pid_t) -> Bool {
+    let task = Process()
+    task.launchPath = "/bin/ps"
+    task.arguments = ["-o", "command=", "-p", "\(pid)"]
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    task.standardError = FileHandle.nullDevice
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        return false
+    }
+    let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+    let output = String(data: outputData, encoding: .utf8) ?? ""
+    return output.contains("--extensionDevelopmentPath")
+}
+
 // MARK: - Find VS Code Windows
 
 func findVSCodeWindows() -> [(window: AXUIElement, app: AXUIElement, title: String, pid: pid_t)] {
@@ -144,6 +222,8 @@ func findVSCodeWindows() -> [(window: AXUIElement, app: AXUIElement, title: Stri
     }
 
     for app in apps {
+        if isDevHostProcess(pid: app.processIdentifier) { continue }
+
         let appEl = AXUIElementCreateApplication(app.processIdentifier)
         guard let windows = axGetArray(appEl, "AXWindows") else { continue }
 
@@ -164,6 +244,11 @@ func findFrontmostVSCodeWindow() -> (window: AXUIElement, title: String, pid: pi
     let frontApp = NSWorkspace.shared.frontmostApplication
     guard let bid = frontApp?.bundleIdentifier, VSCODE_BUNDLES.contains(bid) else {
         fputs("Frontmost app is not VS Code.\n", stderr)
+        return nil
+    }
+
+    if isDevHostProcess(pid: frontApp!.processIdentifier) {
+        fputs("Frontmost app is a VS Code dev host instance.\n", stderr)
         return nil
     }
 
@@ -334,12 +419,22 @@ func cmdSaveWin() {
         label: label
     )
 
+    let fingerPrint = displayFingerprint()
+
+    var store: [String: WindowInfo] = [:]
+    if FileManager.default.fileExists(atPath: WIN_CONFIG_PATH),
+       let existingData = try? Data(contentsOf: URL(fileURLWithPath: WIN_CONFIG_PATH)) {
+        store = (try? JSONDecoder().decode([String: WindowInfo].self, from: existingData)) ?? [:]
+    }
+
+    store[fingerPrint] = info
+
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
 
     let json: Data
     do {
-        json = try encoder.encode(info)
+        json = try encoder.encode(store)
     } catch {
         fputs("Failed to encode JSON: \(error)\n", stderr)
         exit(1)
@@ -358,6 +453,9 @@ func cmdSaveWin() {
     print("  \"\(info.label)\"")
     print("  pos=(\(Int(info.x)), \(Int(info.y)))  size=\(Int(info.width))x\(Int(info.height))")
     print("  screen: \(info.screenFrame)")
+    print("")
+    print("Display layout:")
+    print(fingerPrint)
 }
 
 // MARK: - Restore Window
@@ -368,12 +466,41 @@ func cmdRestoreWin() {
         exit(1)
     }
 
-    let target: WindowInfo
+    let fingerPrint = displayFingerprint()
+
+    let store: [String: WindowInfo]
+    let jsonData: Data
     do {
-        let jsonData = try Data(contentsOf: URL(fileURLWithPath: WIN_CONFIG_PATH))
-        target = try JSONDecoder().decode(WindowInfo.self, from: jsonData)
+        jsonData = try Data(contentsOf: URL(fileURLWithPath: WIN_CONFIG_PATH))
     } catch {
         fputs("Failed to read saved data: \(error)\n", stderr)
+        exit(1)
+    }
+
+    if let dict = try? JSONDecoder().decode([String: WindowInfo].self, from: jsonData) {
+        store = dict
+    } else if let legacy = try? JSONDecoder().decode(WindowInfo.self, from: jsonData) {
+        store = ["legacy": legacy]
+    } else {
+        fputs("Failed to parse saved data.\n", stderr)
+        exit(1)
+    }
+
+    let target: WindowInfo
+    if let match = store[fingerPrint] {
+        target = match
+    } else if store.count == 1, let only = store.values.first {
+        fputs("No saved config for current display layout; using the only available saved config.\n", stderr)
+        print("\nCurrent layout:\n\(fingerPrint)\n")
+        target = only
+    } else {
+        fputs("No saved config for current display layout.\n", stderr)
+        print("\nCurrent layout:\n\(fingerPrint)\n")
+        print("Available layouts:")
+        for (key, _) in store {
+            print("---")
+            print(key)
+        }
         exit(1)
     }
 
