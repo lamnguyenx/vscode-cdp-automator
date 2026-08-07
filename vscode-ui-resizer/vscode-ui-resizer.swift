@@ -11,8 +11,11 @@ let VSCODE_BUNDLES = [
     "com.visualstudio.code.oss",
 ]
 
-let WIN_CONFIG_PATH = NSString(string: "~/.config/vscode/windows.json").expandingTildeInPath
-let LAYOUT_CONFIG_PATH = NSString(string: "~/.config/vscode/panel-and-bar-sides.json").expandingTildeInPath
+let CONFIG_PATH = NSString(string: "~/.config/vscode-cdp-automator/config.json").expandingTildeInPath
+let LEGACY_WIN_CONFIG_PATH = NSString(string: "~/.config/vscode/windows.json").expandingTildeInPath
+let LEGACY_LAYOUT_CONFIG_PATH = NSString(string: "~/.config/vscode/panel-and-bar-sides.json").expandingTildeInPath
+let USER_SETTINGS_PATH = NSString(string: "~/Library/Application Support/Code/User/settings.json").expandingTildeInPath
+let ZOOM_LEVEL_KEY = "window.zoomLevel"
 
 // MARK: - Window Data
 
@@ -27,6 +30,86 @@ struct WindowInfo: Codable {
     let screenRelativeX: Double?
     let screenRelativeY: Double?
     let label: String
+}
+
+// MARK: - Unified Config Store
+
+struct PartSize: Codable {
+    let width: Int
+    let height: Int
+}
+
+struct LayoutConfig: Codable {
+    var sidebar: PartSize?
+    var panel: PartSize?
+    var editor: PartSize?
+    var activitybar: PartSize?
+    var auxiliarybar: PartSize?
+    var workbench: PartSize?
+    var sidebar_position: String?
+    var panel_position: String?
+    var zoom_level: Double?
+    var zoom_percent: Int?
+}
+
+struct DisplayConfig: Codable {
+    var window: WindowInfo?
+    var layout: LayoutConfig?
+}
+
+func loadConfigStore() -> [String: DisplayConfig] {
+    if FileManager.default.fileExists(atPath: CONFIG_PATH),
+       let data = try? Data(contentsOf: URL(fileURLWithPath: CONFIG_PATH)),
+       let store = try? JSONDecoder().decode([String: DisplayConfig].self, from: data) {
+        return store
+    }
+
+    var store: [String: DisplayConfig] = [:]
+
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: LEGACY_WIN_CONFIG_PATH)) {
+        if let dict = try? JSONDecoder().decode([String: WindowInfo].self, from: data) {
+            for (key, info) in dict {
+                store[key] = DisplayConfig(window: info, layout: nil)
+            }
+        } else if let legacy = try? JSONDecoder().decode(WindowInfo.self, from: data) {
+            store["legacy"] = DisplayConfig(window: legacy, layout: nil)
+        }
+    }
+
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: LEGACY_LAYOUT_CONFIG_PATH)),
+       let layout = try? JSONDecoder().decode(LayoutConfig.self, from: data) {
+        if store.isEmpty {
+            store["legacy"] = DisplayConfig(window: nil, layout: layout)
+        } else {
+            for key in store.keys {
+                store[key]?.layout = layout
+            }
+        }
+    }
+
+    if !store.isEmpty {
+        _ = saveConfigStore(store)
+        fputs("Migrated legacy configs to \(CONFIG_PATH)\n", stderr)
+    }
+
+    return store
+}
+
+func saveConfigStore(_ store: [String: DisplayConfig]) -> Bool {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+    guard let data = try? encoder.encode(store) else { return false }
+
+    let dir = (CONFIG_PATH as NSString).deletingLastPathComponent
+    do {
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try data.write(to: URL(fileURLWithPath: CONFIG_PATH), options: .atomic)
+        return true
+    } catch {
+        fputs("Failed to write \(CONFIG_PATH): \(error)\n", stderr)
+        return false
+    }
 }
 
 func resolveGlobalPosition(from info: WindowInfo) -> CGPoint {
@@ -385,6 +468,64 @@ func newWebSocket(_ urlStr: String) -> URLSessionWebSocketTask? {
     return task
 }
 
+// MARK: - Zoom Helpers
+
+func zoomLevelFromFactor(_ factor: Double) -> Double {
+    return log(factor) / log(1.2)
+}
+
+func zoomLevelFromPercent(_ percent: Double) -> Double {
+    return log(percent / 100.0) / log(1.2)
+}
+
+func roundToZoomGrid(_ percent: Double) -> Double {
+    return (percent / 5.0).rounded() * 5.0
+}
+
+func readZoomFactor(_ task: URLSessionWebSocketTask) -> Double? {
+    let raw = evalJS(task, """
+    (() => {
+        const el = document.querySelector('.part.titlebar');
+        if (!el) return 'null';
+        return el.style.getPropertyValue('--zoom-factor') || 'null';
+    })()
+    """)
+    return Double(raw)
+}
+
+func verifyZoomLevel(_ task: URLSessionWebSocketTask, targetLevel: Double) -> Bool {
+    guard let factor = readZoomFactor(task) else { return false }
+    return abs(factor - pow(1.2, targetLevel)) < 0.01
+}
+
+func writeZoomLevelToUserSettings(_ level: Double) -> Bool {
+    let value = String(format: "%.17g", level)
+    let settingsURL = URL(fileURLWithPath: USER_SETTINGS_PATH)
+
+    guard var text = try? String(contentsOf: settingsURL, encoding: .utf8) else {
+        fputs("Cannot read \(USER_SETTINGS_PATH)\n", stderr)
+        return false
+    }
+
+    let pattern = "\"\(ZOOM_LEVEL_KEY)\"\\s*:\\s*[+-]?[0-9]*\\.?[0-9]+([eE][+-]?[0-9]+)?"
+    if let range = text.range(of: pattern, options: .regularExpression) {
+        text.replaceSubrange(range, with: "\"\(ZOOM_LEVEL_KEY)\": \(value)")
+    } else if text.hasPrefix("{") {
+        text.insert(contentsOf: "    \"\(ZOOM_LEVEL_KEY)\": \(value),\n", at: text.index(text.startIndex, offsetBy: 1))
+    } else {
+        fputs("Unexpected settings file format (no leading '{').\n", stderr)
+        return false
+    }
+
+    do {
+        try text.write(to: settingsURL, atomically: true, encoding: .utf8)
+        return true
+    } catch {
+        fputs("Failed to write \(USER_SETTINGS_PATH): \(error)\n", stderr)
+        return false
+    }
+}
+
 // MARK: - Save Window
 
 func cmdSaveWin() {
@@ -421,35 +562,14 @@ func cmdSaveWin() {
 
     let fingerPrint = displayFingerprint()
 
-    var store: [String: WindowInfo] = [:]
-    if FileManager.default.fileExists(atPath: WIN_CONFIG_PATH),
-       let existingData = try? Data(contentsOf: URL(fileURLWithPath: WIN_CONFIG_PATH)) {
-        store = (try? JSONDecoder().decode([String: WindowInfo].self, from: existingData)) ?? [:]
-    }
+    var store = loadConfigStore()
+    var entry = store[fingerPrint] ?? DisplayConfig(window: nil, layout: nil)
+    entry.window = info
+    store[fingerPrint] = entry
 
-    store[fingerPrint] = info
+    guard saveConfigStore(store) else { exit(1) }
 
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-
-    let json: Data
-    do {
-        json = try encoder.encode(store)
-    } catch {
-        fputs("Failed to encode JSON: \(error)\n", stderr)
-        exit(1)
-    }
-
-    let dir = (WIN_CONFIG_PATH as NSString).deletingLastPathComponent
-    do {
-        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        try json.write(to: URL(fileURLWithPath: WIN_CONFIG_PATH), options: .atomic)
-    } catch {
-        fputs("Failed to write \(WIN_CONFIG_PATH): \(error)\n", stderr)
-        exit(1)
-    }
-
-    print("Saved → \(WIN_CONFIG_PATH)")
+    print("Saved → \(CONFIG_PATH)")
     print("  \"\(info.label)\"")
     print("  pos=(\(Int(info.x)), \(Int(info.y)))  size=\(Int(info.width))x\(Int(info.height))")
     print("  screen: \(info.screenFrame)")
@@ -461,35 +581,18 @@ func cmdSaveWin() {
 // MARK: - Restore Window
 
 func cmdRestoreWin() {
-    guard FileManager.default.fileExists(atPath: WIN_CONFIG_PATH) else {
-        fputs("No saved data at \(WIN_CONFIG_PATH). Run 'save-win' first.\n", stderr)
+    let store = loadConfigStore()
+    guard !store.isEmpty else {
+        fputs("No saved data at \(CONFIG_PATH). Run 'save-win' first.\n", stderr)
         exit(1)
     }
 
     let fingerPrint = displayFingerprint()
 
-    let store: [String: WindowInfo]
-    let jsonData: Data
-    do {
-        jsonData = try Data(contentsOf: URL(fileURLWithPath: WIN_CONFIG_PATH))
-    } catch {
-        fputs("Failed to read saved data: \(error)\n", stderr)
-        exit(1)
-    }
-
-    if let dict = try? JSONDecoder().decode([String: WindowInfo].self, from: jsonData) {
-        store = dict
-    } else if let legacy = try? JSONDecoder().decode(WindowInfo.self, from: jsonData) {
-        store = ["legacy": legacy]
-    } else {
-        fputs("Failed to parse saved data.\n", stderr)
-        exit(1)
-    }
-
     let target: WindowInfo
-    if let match = store[fingerPrint] {
+    if let match = store[fingerPrint]?.window {
         target = match
-    } else if store.count == 1, let only = store.values.first {
+    } else if store.count == 1, let only = store.values.first?.window {
         fputs("No saved config for current display layout; using the only available saved config.\n", stderr)
         print("\nCurrent layout:\n\(fingerPrint)\n")
         target = only
@@ -497,9 +600,10 @@ func cmdRestoreWin() {
         fputs("No saved config for current display layout.\n", stderr)
         print("\nCurrent layout:\n\(fingerPrint)\n")
         print("Available layouts:")
-        for (key, _) in store {
+        for (key, entry) in store {
             print("---")
             print(key)
+            if entry.window == nil { print("  (no saved window)") }
         }
         exit(1)
     }
@@ -618,29 +722,55 @@ func cmdSaveLayout(port: Int) {
     """)
 
     guard let rawData = raw.data(using: .utf8),
-          var data = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any]
+          let data = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any]
     else { exit(1) }
 
-    data["_window_title"] = title
+    func partSize(_ key: String) -> PartSize? {
+        guard let p = data[key] as? [String: Any],
+              let w = p["width"] as? Int,
+              let h = p["height"] as? Int
+        else { return nil }
+        return PartSize(width: w, height: h)
+    }
 
-    let dir = (LAYOUT_CONFIG_PATH as NSString).deletingLastPathComponent
-    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    guard let jsonData = try? JSONSerialization.data(withJSONObject: data, options: .prettyPrinted)
-    else { exit(1) }
-    try? jsonData.write(to: URL(fileURLWithPath: LAYOUT_CONFIG_PATH), options: .atomic)
+    var layout = LayoutConfig()
+    layout.sidebar = partSize("sidebar")
+    layout.panel = partSize("panel")
+    layout.editor = partSize("editor")
+    layout.activitybar = partSize("activitybar")
+    layout.auxiliarybar = partSize("auxiliarybar")
+    layout.workbench = partSize("workbench")
+    layout.sidebar_position = data["sidebar_position"] as? String
+    layout.panel_position = data["panel_position"] as? String
 
-    let sidebar = (data["sidebar"] as? [String: Any])?["width"] ?? "?"
-    let panel = (data["panel"] as? [String: Any])?["width"] ?? "?"
-    let editor = (data["editor"] as? [String: Any])?["width"] ?? "?"
-    let activity = (data["activitybar"] as? [String: Any])?["width"] ?? "?"
-    let sbPos = data["sidebar_position"] as? String ?? "?"
-    let pnPos = data["panel_position"] as? String ?? "?"
+    if let factor = readZoomFactor(task) {
+        let pct = roundToZoomGrid(factor * 100.0)
+        layout.zoom_level = zoomLevelFromPercent(pct)
+        layout.zoom_percent = Int(pct)
+    }
 
-    print("\nSaved \"\(title)\" to \(LAYOUT_CONFIG_PATH):")
+    let fingerPrint = displayFingerprint()
+    var store = loadConfigStore()
+    var entry = store[fingerPrint] ?? DisplayConfig(window: nil, layout: nil)
+    entry.layout = layout
+    store[fingerPrint] = entry
+    guard saveConfigStore(store) else { exit(1) }
+
+    let sidebar = layout.sidebar?.width ?? 0
+    let panel = layout.panel?.width ?? 0
+    let editor = layout.editor?.width ?? 0
+    let activity = layout.activitybar?.width ?? 0
+    let sbPos = layout.sidebar_position ?? "?"
+    let pnPos = layout.panel_position ?? "?"
+
+    print("\nSaved \"\(title)\" to \(CONFIG_PATH):")
     print("  sidebar:  \(sidebar)px (\(sbPos))")
     print("  panel:    \(panel)px (\(pnPos))")
     print("  editor:   \(editor)px")
     print("  activity: \(activity)px")
+    if let zoom = layout.zoom_percent {
+        print("  zoom:     \(zoom)%")
+    }
 }
 
 // MARK: - Restore Layout
@@ -919,31 +1049,74 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
 }
 
 func cmdRestoreLayout(port: Int) {
-    guard FileManager.default.fileExists(atPath: LAYOUT_CONFIG_PATH) else {
-        fputs("No saved sizes at \(LAYOUT_CONFIG_PATH). Run 'save-layout' first.\n", stderr)
+    let store = loadConfigStore()
+    guard !store.isEmpty else {
+        fputs("No saved data at \(CONFIG_PATH). Run 'save-layout' first.\n", stderr)
         exit(1)
     }
 
-    guard let jsonData = try? Data(contentsOf: URL(fileURLWithPath: LAYOUT_CONFIG_PATH)),
-          let target = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-          let sidebar = target["sidebar"] as? [String: Any],
-          let panel = target["panel"] as? [String: Any]
-    else { exit(1) }
+    let fingerPrint = displayFingerprint()
 
-    let tSidebar = sidebar["width"] as? Int ?? 0
-    let savedPanelPos = target["panel_position"] as? String ?? ""
+    let layout: LayoutConfig
+    if let match = store[fingerPrint]?.layout {
+        layout = match
+    } else if store.count == 1, let only = store.values.first?.layout {
+        fputs("No saved layout for current display layout; using the only available saved config.\n", stderr)
+        print("\nCurrent layout:\n\(fingerPrint)\n")
+        layout = only
+    } else {
+        fputs("No saved layout for current display layout.\n", stderr)
+        print("\nCurrent layout:\n\(fingerPrint)\n")
+        print("Available layouts:")
+        for (key, entry) in store {
+            print("---")
+            print(key)
+            if entry.layout == nil { print("  (no saved layout)") }
+        }
+        exit(1)
+    }
+
+    let tSidebar = layout.sidebar?.width ?? 0
+    let savedPanelPos = layout.panel_position ?? ""
     let tPanel: Int
     let panelDimLabel: String
     if savedPanelPos == "bottom" || savedPanelPos == "top" {
-        tPanel = panel["height"] as? Int ?? 0
+        tPanel = layout.panel?.height ?? 0
         panelDimLabel = "h"
     } else {
-        tPanel = panel["width"] as? Int ?? 0
+        tPanel = layout.panel?.width ?? 0
         panelDimLabel = ""
     }
+    let tZoomLevel = layout.zoom_level
+    let tZoomPercent = layout.zoom_percent
 
     let windows = fetchTargets(port: port)
-    print("Restoring \(windows.count) window(s) to sidebar=\(tSidebar)px  panel=\(tPanel)px\(panelDimLabel)\n")
+    print("Restoring \(windows.count) window(s) to sidebar=\(tSidebar)px  panel=\(tPanel)px\(panelDimLabel)\(tZoomPercent.map { "  zoom=\($0)%" } ?? "")\n")
+
+    if let zl = tZoomLevel {
+        let roundedPct = roundToZoomGrid(pow(1.2, zl) * 100.0)
+        let gridLevel = zoomLevelFromPercent(roundedPct)
+        print("Applying zoom \(Int(roundedPct))% (level \(String(format: "%.4f", gridLevel))) via \(USER_SETTINGS_PATH)")
+        if writeZoomLevelToUserSettings(gridLevel) {
+            Thread.sleep(forTimeInterval: 1.0)
+            for (idx, t) in windows.enumerated() {
+                guard let wsUrl = t["webSocketDebuggerUrl"] as? String,
+                      let task = newWebSocket(wsUrl)
+                else { continue }
+                var zoomOk = false
+                for _ in 1...5 {
+                    if verifyZoomLevel(task, targetLevel: gridLevel) {
+                        zoomOk = true
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.5)
+                }
+                task.cancel(with: .normalClosure, reason: nil)
+                print("[\(idx)] zoom: \(zoomOk ? "OK" : "FAILED after 5 attempts")")
+            }
+        }
+        print("")
+    }
 
     for (idx, t) in windows.enumerated() {
         guard let wsUrl = t["webSocketDebuggerUrl"] as? String else { continue }
@@ -1014,8 +1187,7 @@ func usage() -> Never {
     print("  \(prog) list-displays          List connected displays with their frames")
     print("")
     print("Default CDP port: 9333")
-    print("Window config: ~/.config/vscode/windows.json")
-    print("Layout config:  ~/.config/vscode/panel-and-bar-sides.json")
+    print("Config: ~/.config/vscode-cdp-automator/config.json")
     exit(1)
 }
 
