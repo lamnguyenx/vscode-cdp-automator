@@ -16,6 +16,7 @@ let LEGACY_WIN_CONFIG_PATH = NSString(string: "~/.config/vscode/windows.json").e
 let LEGACY_LAYOUT_CONFIG_PATH = NSString(string: "~/.config/vscode/panel-and-bar-sides.json").expandingTildeInPath
 let USER_SETTINGS_PATH = NSString(string: "~/Library/Application Support/Code/User/settings.json").expandingTildeInPath
 let ZOOM_LEVEL_KEY = "window.zoomLevel"
+let CODESERVER_PORT = 9222
 
 // MARK: - Window Data
 
@@ -55,6 +56,7 @@ struct LayoutConfig: Codable {
 struct DisplayConfig: Codable {
     var window: WindowInfo?
     var layout: LayoutConfig?
+    var codeServerLayout: LayoutConfig?
 }
 
 func loadConfigStore() -> [String: DisplayConfig] {
@@ -387,20 +389,34 @@ func getFrontmostVSCodeTitle() -> String? {
 
 // MARK: - CDP Helpers
 
-func fetchTargets(port: Int) -> [[String: Any]] {
+func tryFetchTargets(port: Int) -> [[String: Any]]? {
     guard let url = URL(string: "http://localhost:\(port)/json"),
           let data = try? Data(contentsOf: url),
           let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-    else {
-        fputs("Cannot reach CDP on port \(port)\n", stderr)
-        exit(1)
+    else { return nil }
+    return json.filter { ($0["url"] as? String)?.hasSuffix("workbench.html") ?? false }
+}
+
+func tryFetchCodeServerTargets(port: Int) -> [[String: Any]]? {
+    guard let url = URL(string: "http://localhost:\(port)/json"),
+          let data = try? Data(contentsOf: url),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+    else { return nil }
+    return json.filter { target in
+        guard (target["type"] as? String) == "page" else { return false }
+        let urlStr = (target["url"] as? String) ?? ""
+        return urlStr.contains("?folder=") || urlStr.contains("?workspace=")
     }
-    let windows = json.filter { ($0["url"] as? String)?.hasSuffix("workbench.html") ?? false }
-    guard !windows.isEmpty else {
-        fputs("No workbench windows found on port \(port)\n", stderr)
-        exit(1)
-    }
-    return windows
+}
+
+func isActiveTab(_ task: URLSessionWebSocketTask) -> Bool {
+    let raw = evalJS(task, "String(document.hasFocus())")
+    return raw == "true"
+}
+
+func isVisibleTab(_ task: URLSessionWebSocketTask) -> Bool {
+    let raw = evalJS(task, "String(document.visibilityState === 'visible')")
+    return raw == "true"
 }
 
 func wsRecv(_ task: URLSessionWebSocketTask) -> String {
@@ -410,14 +426,16 @@ func wsRecv(_ task: URLSessionWebSocketTask) -> String {
         if case .success(let msg) = result, case .string(let s) = msg { raw = s }
         sem.signal()
     }
-    sem.wait()
+    if sem.wait(timeout: .now() + 5) == .timedOut {
+        return ""
+    }
     return raw
 }
 
 func wsSend(_ task: URLSessionWebSocketTask, _ text: String, waitForId id: Int? = nil) -> String {
     let sem = DispatchSemaphore(value: 0)
     task.send(.string(text)) { _ in sem.signal() }
-    sem.wait()
+    _ = sem.wait(timeout: .now() + 5)
 
     guard let mid = id else {
         return wsRecv(task)
@@ -426,6 +444,7 @@ func wsSend(_ task: URLSessionWebSocketTask, _ text: String, waitForId id: Int? 
     let needle = "\"id\":\(mid)"
     for _ in 0..<500 {
         let raw = wsRecv(task)
+        if raw.isEmpty { break }
         if !raw.contains(needle) { continue }
         guard let data = raw.data(using: .utf8),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -466,6 +485,50 @@ func newWebSocket(_ urlStr: String) -> URLSessionWebSocketTask? {
     let task = URLSession.shared.webSocketTask(with: url)
     task.resume()
     return task
+}
+
+// MARK: - Restore Eligibility
+
+struct Eligibility {
+    let sidebarOnLeft: Bool
+    let panelOnRight: Bool
+    let maximized: Bool
+}
+
+func readEligibility(_ task: URLSessionWebSocketTask) -> Eligibility? {
+    let raw = evalJS(task, """
+    (() => {
+        const sb = document.querySelector('.part.sidebar');
+        const pn = document.querySelector('.part.panel');
+        const ed = document.querySelector('.part.editor');
+        const sbOnLeft = !!sb && sb.classList.contains('left') && sb.getBoundingClientRect().width > 5;
+        const pnOnRight = !!pn && pn.classList.contains('right') && pn.getBoundingClientRect().width > 5;
+        let maximized = false;
+        if (pn && ed) {
+            const pb = pn.getBoundingClientRect();
+            const eb = ed.getBoundingClientRect();
+            if ((eb.width < 5 && pb.width > 50) || (eb.height < 5 && pb.height > 50)) maximized = true;
+            const btn = pn.querySelector('.actions-container .action-label.codicon-panel-maximize');
+            if (btn && btn.classList.contains('checked')) maximized = true;
+        }
+        return JSON.stringify({ sbOnLeft, pnOnRight, maximized });
+    })()
+    """)
+    guard let data = raw.data(using: .utf8),
+          let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let sb = dict["sbOnLeft"] as? Bool,
+          let pn = dict["pnOnRight"] as? Bool,
+          let mx = dict["maximized"] as? Bool
+    else { return nil }
+    return Eligibility(sidebarOnLeft: sb, panelOnRight: pn, maximized: mx)
+}
+
+func normalizedTitle(_ title: String) -> String {
+    var t = title
+    for suffix in [" — Visual Studio Code - Exploration", " — Visual Studio Code - Insiders", " — Visual Studio Code"] {
+        t = t.replacingOccurrences(of: suffix, with: "")
+    }
+    return t
 }
 
 // MARK: - Zoom Helpers
@@ -530,7 +593,8 @@ func writeZoomLevelToUserSettings(_ level: Double) -> Bool {
 
 func cmdSaveWin() {
     guard let (win, title, pid) = findFrontmostVSCodeWindow() else {
-        exit(1)
+        fputs("Skipping save-win: no VS Code window found.\n", stderr)
+        return
     }
 
     guard let pos = axGetPoint(win, "AXPosition"),
@@ -580,11 +644,11 @@ func cmdSaveWin() {
 
 // MARK: - Restore Window
 
-func cmdRestoreWin() {
+func cmdRestoreWin(port: Int) {
     let store = loadConfigStore()
     guard !store.isEmpty else {
-        fputs("No saved data at \(CONFIG_PATH). Run 'save-win' first.\n", stderr)
-        exit(1)
+        fputs("Skipping restore-win: no saved data at \(CONFIG_PATH).\n", stderr)
+        return
     }
 
     let fingerPrint = displayFingerprint()
@@ -597,21 +661,14 @@ func cmdRestoreWin() {
         print("\nCurrent layout:\n\(fingerPrint)\n")
         target = only
     } else {
-        fputs("No saved config for current display layout.\n", stderr)
-        print("\nCurrent layout:\n\(fingerPrint)\n")
-        print("Available layouts:")
-        for (key, entry) in store {
-            print("---")
-            print(key)
-            if entry.window == nil { print("  (no saved window)") }
-        }
-        exit(1)
+        fputs("Skipping restore-win: no saved window for current display layout.\n", stderr)
+        return
     }
 
     let current = findVSCodeWindows()
     guard !current.isEmpty else {
-        fputs("No VS Code windows currently open.\n", stderr)
-        exit(1)
+        fputs("Skipping restore-win: no VS Code windows currently open.\n", stderr)
+        return
     }
 
     let resolvedPos = resolveGlobalPosition(from: target)
@@ -622,6 +679,20 @@ func cmdRestoreWin() {
         print("Saved screen not found; falling back to raw coordinates.")
     }
 
+    var eligibilityByTitle: [String: Eligibility] = [:]
+    if let targets = tryFetchTargets(port: port) {
+        for t in targets {
+            guard let wsUrl = t["webSocketDebuggerUrl"] as? String,
+                  let title = t["title"] as? String,
+                  let task = newWebSocket(wsUrl)
+            else { continue }
+            if let el = readEligibility(task) {
+                eligibilityByTitle[normalizedTitle(title)] = el
+            }
+            task.cancel(with: .normalClosure, reason: nil)
+        }
+    }
+
     print("Applying to \(current.count) open window(s):")
     print("  target: pos=(\(Int(globalPos.x)), \(Int(globalPos.y)))  size=\(Int(target.width))x\(Int(target.height))\n")
 
@@ -629,6 +700,21 @@ func cmdRestoreWin() {
         let (win, _, title, _) = current[i]
 
         print("[\(i+1)] \"\(title)\"")
+
+        if let el = eligibilityByTitle[normalizedTitle(title)] {
+            if el.maximized {
+                print("    skipped: panel is maximized (full-width)")
+                continue
+            }
+            if !el.sidebarOnLeft {
+                print("    skipped: primary sidebar not on the left")
+                continue
+            }
+            if !el.panelOnRight {
+                print("    skipped: panel not on the right")
+                continue
+            }
+        }
 
         if isFullScreen(win) {
             print("    full-screen detected, exiting...")
@@ -675,24 +761,7 @@ func cmdRestoreWin() {
 
 // MARK: - Save Layout
 
-func cmdSaveLayout(port: Int) {
-    guard let activeTitle = getFrontmostVSCodeTitle() else {
-        fputs("Frontmost app is not VS Code.\n", stderr)
-        exit(1)
-    }
-
-    let windows = fetchTargets(port: port)
-
-    guard let t = windows.first(where: { ($0["title"] as? String) == activeTitle })
-            ?? windows.first,
-          let wsUrl = t["webSocketDebuggerUrl"] as? String,
-          let task = newWebSocket(wsUrl)
-    else { exit(1) }
-    defer { task.cancel(with: .normalClosure, reason: nil) }
-
-    let title = (t["title"] as? String) ?? "unknown"
-    print("Saving from: \(title)")
-
+func readLayoutFromTab(_ task: URLSessionWebSocketTask) -> LayoutConfig? {
     let raw = evalJS(task, """
     (() => {
         const r = {};
@@ -723,7 +792,7 @@ func cmdSaveLayout(port: Int) {
 
     guard let rawData = raw.data(using: .utf8),
           let data = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any]
-    else { exit(1) }
+    else { return nil }
 
     func partSize(_ key: String) -> PartSize? {
         guard let p = data[key] as? [String: Any],
@@ -747,6 +816,42 @@ func cmdSaveLayout(port: Int) {
         let pct = roundToZoomGrid(factor * 100.0)
         layout.zoom_level = zoomLevelFromPercent(pct)
         layout.zoom_percent = Int(pct)
+    }
+
+    if layout.sidebar == nil && layout.panel == nil && layout.editor == nil {
+        return nil
+    }
+
+    return layout
+}
+
+func cmdSaveLayout(port: Int) {
+    guard let activeTitle = getFrontmostVSCodeTitle() else {
+        fputs("Skipping save-layout: frontmost app is not VS Code.\n", stderr)
+        return
+    }
+
+    guard let windows = tryFetchTargets(port: port), !windows.isEmpty else {
+        fputs("Skipping save-layout: cannot reach VS Code CDP on port \(port).\n", stderr)
+        return
+    }
+
+    guard let t = windows.first(where: { ($0["title"] as? String) == activeTitle })
+            ?? windows.first,
+          let wsUrl = t["webSocketDebuggerUrl"] as? String,
+          let task = newWebSocket(wsUrl)
+    else {
+        fputs("Skipping save-layout: could not connect to a VS Code window.\n", stderr)
+        return
+    }
+    defer { task.cancel(with: .normalClosure, reason: nil) }
+
+    let title = (t["title"] as? String) ?? "unknown"
+    print("Saving from: \(title)")
+
+    guard let layout = readLayoutFromTab(task) else {
+        fputs("Skipping save-layout: could not read layout from \(title) (workbench not ready?).\n", stderr)
+        return
     }
 
     let fingerPrint = displayFingerprint()
@@ -926,6 +1031,21 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
 
     let panelPos = readPanelPosition(task)
 
+    if let el = readEligibility(task) {
+        if el.maximized {
+            print("\(prefix)panel is maximized (full-width) — skipping this window")
+            return
+        }
+        if !el.sidebarOnLeft {
+            print("\(prefix)primary sidebar not on the left — skipping this window")
+            return
+        }
+        if !el.panelOnRight {
+            print("\(prefix)panel not on the right — skipping this window")
+            return
+        }
+    }
+
     let isBottom = panelPos == "bottom"
     let smap = isBottom ? solveSashMappingVertical(task) : solveSashMappingHorizontal(task)
     var seIdx = smap["sidebar_editor"]
@@ -1051,8 +1171,8 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
 func cmdRestoreLayout(port: Int) {
     let store = loadConfigStore()
     guard !store.isEmpty else {
-        fputs("No saved data at \(CONFIG_PATH). Run 'save-layout' first.\n", stderr)
-        exit(1)
+        fputs("Skipping restore-layout: no saved data at \(CONFIG_PATH).\n", stderr)
+        return
     }
 
     let fingerPrint = displayFingerprint()
@@ -1065,15 +1185,8 @@ func cmdRestoreLayout(port: Int) {
         print("\nCurrent layout:\n\(fingerPrint)\n")
         layout = only
     } else {
-        fputs("No saved layout for current display layout.\n", stderr)
-        print("\nCurrent layout:\n\(fingerPrint)\n")
-        print("Available layouts:")
-        for (key, entry) in store {
-            print("---")
-            print(key)
-            if entry.layout == nil { print("  (no saved layout)") }
-        }
-        exit(1)
+        fputs("Skipping restore-layout: no saved layout for current display layout.\n", stderr)
+        return
     }
 
     let tSidebar = layout.sidebar?.width ?? 0
@@ -1090,7 +1203,10 @@ func cmdRestoreLayout(port: Int) {
     let tZoomLevel = layout.zoom_level
     let tZoomPercent = layout.zoom_percent
 
-    let windows = fetchTargets(port: port)
+    guard let windows = tryFetchTargets(port: port), !windows.isEmpty else {
+        fputs("Skipping restore-layout: cannot reach VS Code CDP on port \(port).\n", stderr)
+        return
+    }
     print("Restoring \(windows.count) window(s) to sidebar=\(tSidebar)px  panel=\(tPanel)px\(panelDimLabel)\(tZoomPercent.map { "  zoom=\($0)%" } ?? "")\n")
 
     if let zl = tZoomLevel {
@@ -1127,6 +1243,124 @@ func cmdRestoreLayout(port: Int) {
     }
 }
 
+// MARK: - Save Code-Server Layout
+
+func cmdSaveCodeServerLayout(port: Int) {
+    guard let targets = tryFetchCodeServerTargets(port: port), !targets.isEmpty else {
+        fputs("Skipping save-codeserver-layout: no code-server tabs found on CDP port \(port).\n", stderr)
+        return
+    }
+
+    var active: [String: Any]?
+    var visible: [String: Any]?
+    var titles: [String] = []
+
+    for t in targets {
+        let title = (t["title"] as? String) ?? "unknown"
+        titles.append(title)
+        guard let wsUrl = t["webSocketDebuggerUrl"] as? String,
+              let task = newWebSocket(wsUrl)
+        else { continue }
+        let activeTab = isActiveTab(task)
+        let visibleTab = activeTab ? true : isVisibleTab(task)
+        task.cancel(with: .normalClosure, reason: nil)
+        if activeTab && active == nil {
+            active = t
+        }
+        if visibleTab && visible == nil {
+            visible = t
+        }
+    }
+
+    guard let chosen = active ?? visible else {
+        fputs("Could not determine the active code-server tab.\n", stderr)
+        fputs("Open tabs:\n", stderr)
+        for title in titles { fputs("  - \(title)\n", stderr) }
+        return
+    }
+
+    guard let wsUrl = chosen["webSocketDebuggerUrl"] as? String,
+          let task = newWebSocket(wsUrl)
+    else {
+        fputs("Could not connect to the active code-server tab.\n", stderr)
+        return
+    }
+    defer { task.cancel(with: .normalClosure, reason: nil) }
+
+    let title = (chosen["title"] as? String) ?? "unknown"
+    print("Saving from (code-server): \(title)")
+
+    guard let layout = readLayoutFromTab(task) else {
+        fputs("Could not read code-server layout from \(title).\n", stderr)
+        return
+    }
+
+    let fingerPrint = displayFingerprint()
+    var store = loadConfigStore()
+    var entry = store[fingerPrint] ?? DisplayConfig(window: nil, layout: nil)
+    entry.codeServerLayout = layout
+    store[fingerPrint] = entry
+    guard saveConfigStore(store) else { exit(1) }
+
+    let sidebar = layout.sidebar?.width ?? 0
+    let panel = layout.panel?.width ?? 0
+    let editor = layout.editor?.width ?? 0
+    let sbPos = layout.sidebar_position ?? "?"
+    let pnPos = layout.panel_position ?? "?"
+
+    print("\nSaved code-server \"\(title)\" to \(CONFIG_PATH):")
+    print("  sidebar:  \(sidebar)px (\(sbPos))")
+    print("  panel:    \(panel)px (\(pnPos))")
+    print("  editor:   \(editor)px")
+}
+
+// MARK: - Restore Code-Server Layout
+
+func cmdRestoreCodeServerLayout(port: Int) {
+    let store = loadConfigStore()
+    guard !store.isEmpty else {
+        fputs("Skipping restore-codeserver-layout: no saved data at \(CONFIG_PATH).\n", stderr)
+        return
+    }
+
+    let fingerPrint = displayFingerprint()
+
+    let layout: LayoutConfig
+    if let match = store[fingerPrint]?.codeServerLayout {
+        layout = match
+    } else if store.count == 1, let only = store.values.first?.codeServerLayout {
+        fputs("No saved code-server layout for current display layout; using the only available saved config.\n", stderr)
+        print("\nCurrent layout:\n\(fingerPrint)\n")
+        layout = only
+    } else {
+        fputs("Skipping restore-codeserver-layout: no saved code-server layout for current display layout.\n", stderr)
+        return
+    }
+
+    let tSidebar = layout.sidebar?.width ?? 0
+    let savedPanelPos = layout.panel_position ?? ""
+    let tPanel: Int
+    if savedPanelPos == "bottom" || savedPanelPos == "top" {
+        tPanel = layout.panel?.height ?? 0
+    } else {
+        tPanel = layout.panel?.width ?? 0
+    }
+
+    guard let targets = tryFetchCodeServerTargets(port: port), !targets.isEmpty else {
+        fputs("Skipping restore-codeserver-layout: no code-server tabs found on CDP port \(port).\n", stderr)
+        return
+    }
+    print("Restoring \(targets.count) code-server tab(s) to sidebar=\(tSidebar)px  panel=\(tPanel)px\n")
+
+    for (idx, t) in targets.enumerated() {
+        guard let wsUrl = t["webSocketDebuggerUrl"] as? String else { continue }
+        let title = (t["title"] as? String) ?? "unknown"
+        print("[\(idx)] \(title)")
+        restoreLayoutWindow(wsUrl: wsUrl, tSidebar: tSidebar, tPanel: tPanel, label: "\(idx)")
+        print("")
+    }
+}
+
 // MARK: - Save All
 
 func runSubCommand(_ args: [String]) -> Int32 {
@@ -1145,19 +1379,26 @@ func cmdSaveAll(port: Int) {
     print("")
     print("=== save-win ===")
     let wr = runSubCommand(["save-win"])
-    if lr != 0 || wr != 0 { exit(1) }
+    print("")
+    print("=== save-codeserver-layout ===")
+    let cr = runSubCommand(["save-codeserver-layout", String(CODESERVER_PORT)])
+    if lr != 0 || wr != 0 || cr != 0 { exit(1) }
 }
 
 // MARK: - Restore All
 
 func cmdRestoreAll(port: Int) {
     print("=== restore-win ===")
-    let wr = runSubCommand(["restore-win"])
+    let wr = runSubCommand(["restore-win", String(port)])
     print("")
     Thread.sleep(forTimeInterval: 0.5)
     print("=== restore-layout ===")
     let lr = runSubCommand(["restore-layout", String(port)])
-    if wr != 0 || lr != 0 { exit(1) }
+    print("")
+    Thread.sleep(forTimeInterval: 0.5)
+    print("=== restore-codeserver-layout ===")
+    let cr = runSubCommand(["restore-codeserver-layout", String(CODESERVER_PORT)])
+    if wr != 0 || lr != 0 || cr != 0 { exit(1) }
 }
 
 // MARK: - List Displays
@@ -1179,14 +1420,17 @@ func usage() -> Never {
     let prog = (CommandLine.arguments[0] as NSString).lastPathComponent
     print("Usage:")
     print("  \(prog) save-win               Save position & size of the frontmost VS Code window")
-    print("  \(prog) restore-win            Apply saved position & size to all open VS Code windows")
+    print("  \(prog) restore-win [port]     Apply saved position & size to eligible VS Code windows")
     print("  \(prog) save-layout [port]     Save panel/sidebar layout of the active VS Code window")
     print("  \(prog) restore-layout [port]  Restore saved panel/sidebar layout to all VS Code windows")
+    print("  \(prog) save-codeserver-layout [port]   Save layout of the active code-server tab in Chrome")
+    print("  \(prog) restore-codeserver-layout [port]  Restore layout to all code-server tabs")
     print("  \(prog) save-all [port]        Save both window and layout in one call")
     print("  \(prog) restore-all [port]     Restore window then layout with proper timing")
     print("  \(prog) list-displays          List connected displays with their frames")
     print("")
     print("Default CDP port: 9333")
+    print("Default code-server CDP port: \(CODESERVER_PORT)")
     print("Config: ~/.config/vscode-cdp-automator/config.json")
     exit(1)
 }
@@ -1199,15 +1443,24 @@ let cdpPort: () -> Int = {
     return 9333
 }
 
+let codeServerPort: () -> Int = {
+    if args.count >= 3, let p = Int(args[2]) { return p }
+    return CODESERVER_PORT
+}
+
 switch args[1] {
 case "save-win":
     cmdSaveWin()
 case "restore-win":
-    cmdRestoreWin()
+    cmdRestoreWin(port: cdpPort())
 case "save-layout":
     cmdSaveLayout(port: cdpPort())
 case "restore-layout":
     cmdRestoreLayout(port: cdpPort())
+case "save-codeserver-layout":
+    cmdSaveCodeServerLayout(port: codeServerPort())
+case "restore-codeserver-layout":
+    cmdRestoreCodeServerLayout(port: codeServerPort())
 case "save-all":
     cmdSaveAll(port: cdpPort())
 case "restore-all":
