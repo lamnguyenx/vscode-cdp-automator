@@ -17,6 +17,7 @@ let LEGACY_LAYOUT_CONFIG_PATH = NSString(string: "~/.config/vscode/panel-and-bar
 let USER_SETTINGS_PATH = NSString(string: "~/Library/Application Support/Code/User/settings.json").expandingTildeInPath
 let ZOOM_LEVEL_KEY = "window.zoomLevel"
 let CODESERVER_PORT = 9222
+let AX_TIMEOUT: Float = 3.0
 
 // MARK: - Window Data
 
@@ -137,19 +138,26 @@ func isPositionOnScreen(_ pt: CGPoint) -> Bool {
 
 // MARK: - Accessibility Helpers
 
+func applyAXTimeout(_ el: AXUIElement) {
+    AXUIElementSetMessagingTimeout(el, AX_TIMEOUT)
+}
+
 func axGetString(_ el: AXUIElement, _ attr: String) -> String? {
+    applyAXTimeout(el)
     var v: CFTypeRef?
     guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
     return v as? String
 }
 
 func axGetArray(_ el: AXUIElement, _ attr: String) -> [AXUIElement]? {
+    applyAXTimeout(el)
     var v: CFTypeRef?
     guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
     return v as? [AXUIElement]
 }
 
 func axGetPoint(_ el: AXUIElement, _ attr: String) -> CGPoint? {
+    applyAXTimeout(el)
     var v: CFTypeRef?
     guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
     var pt = CGPoint.zero
@@ -158,6 +166,7 @@ func axGetPoint(_ el: AXUIElement, _ attr: String) -> CGPoint? {
 }
 
 func axGetSize(_ el: AXUIElement, _ attr: String) -> CGSize? {
+    applyAXTimeout(el)
     var v: CFTypeRef?
     guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
     var sz = CGSize.zero
@@ -166,6 +175,7 @@ func axGetSize(_ el: AXUIElement, _ attr: String) -> CGSize? {
 }
 
 func axSetPoint(_ el: AXUIElement, _ attr: String, _ pt: CGPoint) {
+    applyAXTimeout(el)
     var p = pt
     if let val = withUnsafePointer(to: &p, { AXValueCreate(.cgPoint, $0) }) {
         AXUIElementSetAttributeValue(el, attr as CFString, val)
@@ -173,6 +183,7 @@ func axSetPoint(_ el: AXUIElement, _ attr: String, _ pt: CGPoint) {
 }
 
 func axSetSize(_ el: AXUIElement, _ attr: String, _ sz: CGSize) {
+    applyAXTimeout(el)
     var s = sz
     if let val = withUnsafePointer(to: &s, { AXValueCreate(.cgSize, $0) }) {
         AXUIElementSetAttributeValue(el, attr as CFString, val)
@@ -180,6 +191,7 @@ func axSetSize(_ el: AXUIElement, _ attr: String, _ sz: CGSize) {
 }
 
 func axGetBool(_ el: AXUIElement, _ attr: String) -> Bool? {
+    applyAXTimeout(el)
     var v: CFTypeRef?
     guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
     return v as? Bool
@@ -190,6 +202,7 @@ func isFullScreen(_ win: AXUIElement) -> Bool {
 }
 
 func exitFullScreen(_ win: AXUIElement) {
+    applyAXTimeout(win)
     AXUIElementSetAttributeValue(win, "AXFullScreen" as CFString, kCFBooleanFalse)
     for _ in 0..<30 {
         Thread.sleep(forTimeInterval: 0.25)
@@ -310,6 +323,7 @@ func findVSCodeWindows() -> [(window: AXUIElement, app: AXUIElement, title: Stri
         if isDevHostProcess(pid: app.processIdentifier) { continue }
 
         let appEl = AXUIElementCreateApplication(app.processIdentifier)
+        applyAXTimeout(appEl)
         guard let windows = axGetArray(appEl, "AXWindows") else { continue }
 
         for win in windows {
@@ -338,6 +352,7 @@ func findFrontmostVSCodeWindow() -> (window: AXUIElement, title: String, pid: pi
     }
 
     let appEl = AXUIElementCreateApplication(frontApp!.processIdentifier)
+    applyAXTimeout(appEl)
 
     var focused: CFTypeRef?
     guard AXUIElementCopyAttributeValue(appEl, "AXFocusedWindow" as CFString, &focused) == .success,
@@ -347,11 +362,13 @@ func findFrontmostVSCodeWindow() -> (window: AXUIElement, title: String, pid: pi
     }
 
     let win = fw as! AXUIElement
+    applyAXTimeout(win)
     var title = axGetString(win, "AXTitle") ?? ""
     if title.isEmpty {
         var main: CFTypeRef?
         if AXUIElementCopyAttributeValue(appEl, "AXMainWindow" as CFString, &main) == .success,
            let mw = main {
+            applyAXTimeout(mw as! AXUIElement)
             title = axGetString(mw as! AXUIElement, "AXTitle") ?? ""
         }
     }
@@ -366,6 +383,7 @@ func getFrontmostVSCodeTitle() -> String? {
     else { return nil }
 
     let appEl = AXUIElementCreateApplication(frontApp.processIdentifier)
+    applyAXTimeout(appEl)
 
     var focused: CFTypeRef?
     guard AXUIElementCopyAttributeValue(appEl, "AXFocusedWindow" as CFString, &focused) == .success,
@@ -373,6 +391,7 @@ func getFrontmostVSCodeTitle() -> String? {
     else { return nil }
 
     let win = fw as! AXUIElement
+    applyAXTimeout(win)
 
     if let title = axGetString(win, "AXTitle"), !title.isEmpty {
         return title
@@ -381,6 +400,7 @@ func getFrontmostVSCodeTitle() -> String? {
     var main: CFTypeRef?
     if AXUIElementCopyAttributeValue(appEl, "AXMainWindow" as CFString, &main) == .success,
        let mw = main {
+        applyAXTimeout(mw as! AXUIElement)
         return axGetString(mw as! AXUIElement, "AXTitle")
     }
 
@@ -389,18 +409,32 @@ func getFrontmostVSCodeTitle() -> String? {
 
 // MARK: - CDP Helpers
 
+func httpGetJSON(_ urlString: String, timeout: TimeInterval = 3.0) -> Any? {
+    guard let url = URL(string: urlString) else { return nil }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = timeout
+    var result: Any?
+    let sem = DispatchSemaphore(value: 0)
+    let task = URLSession.shared.dataTask(with: req) { data, _, _ in
+        if let data = data {
+            result = try? JSONSerialization.jsonObject(with: data)
+        }
+        sem.signal()
+    }
+    task.resume()
+    _ = sem.wait(timeout: .now() + timeout + 1)
+    task.cancel()
+    return result
+}
+
 func tryFetchTargets(port: Int) -> [[String: Any]]? {
-    guard let url = URL(string: "http://localhost:\(port)/json"),
-          let data = try? Data(contentsOf: url),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+    guard let json = httpGetJSON("http://localhost:\(port)/json") as? [[String: Any]]
     else { return nil }
     return json.filter { ($0["url"] as? String)?.hasSuffix("workbench.html") ?? false }
 }
 
 func tryFetchCodeServerTargets(port: Int) -> [[String: Any]]? {
-    guard let url = URL(string: "http://localhost:\(port)/json"),
-          let data = try? Data(contentsOf: url),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+    guard let json = httpGetJSON("http://localhost:\(port)/json") as? [[String: Any]]
     else { return nil }
     return json.filter { target in
         guard (target["type"] as? String) == "page" else { return false }
