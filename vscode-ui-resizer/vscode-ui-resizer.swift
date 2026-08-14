@@ -11,6 +11,8 @@ let VSCODE_BUNDLES = [
     "com.visualstudio.code.oss",
 ]
 
+let VIVALDI_BUNDLE_ID = "com.vivaldi.Vivaldi"
+
 let CONFIG_PATH = NSString(string: "~/.config/vscode-cdp-automator/config.json").expandingTildeInPath
 let LEGACY_WIN_CONFIG_PATH = NSString(string: "~/.config/vscode/windows.json").expandingTildeInPath
 let LEGACY_LAYOUT_CONFIG_PATH = NSString(string: "~/.config/vscode/panel-and-bar-sides.json").expandingTildeInPath
@@ -54,10 +56,17 @@ struct LayoutConfig: Codable {
     var zoom_percent: Int?
 }
 
+struct VivaldiConfig: Codable {
+    var tabBarWidth: Int?
+    var tabBarPosition: String?
+    var window: WindowInfo?
+}
+
 struct DisplayConfig: Codable {
     var window: WindowInfo?
     var layout: LayoutConfig?
     var codeServerLayout: LayoutConfig?
+    var vivaldi: VivaldiConfig?
 }
 
 func loadConfigStore() -> [String: DisplayConfig] {
@@ -407,6 +416,54 @@ func getFrontmostVSCodeTitle() -> String? {
     return nil
 }
 
+// MARK: - Find Vivaldi Windows
+
+func findVivaldiWindows() -> [(window: AXUIElement, app: AXUIElement, title: String, pid: pid_t)] {
+    var results: [(AXUIElement, AXUIElement, String, pid_t)] = []
+
+    let apps = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == VIVALDI_BUNDLE_ID }
+
+    for app in apps {
+        let appEl = AXUIElementCreateApplication(app.processIdentifier)
+        applyAXTimeout(appEl)
+        guard let windows = axGetArray(appEl, "AXWindows") else { continue }
+
+        for win in windows {
+            let title = axGetString(win, "AXTitle") ?? ""
+            results.append((win, appEl, title, app.processIdentifier))
+        }
+    }
+
+    return results
+}
+
+func findFrontmostVivaldiWindow() -> (window: AXUIElement, title: String, pid: pid_t)? {
+    guard let frontApp = NSWorkspace.shared.frontmostApplication,
+          frontApp.bundleIdentifier == VIVALDI_BUNDLE_ID
+    else { return nil }
+
+    let appEl = AXUIElementCreateApplication(frontApp.processIdentifier)
+    applyAXTimeout(appEl)
+
+    var focused: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appEl, "AXFocusedWindow" as CFString, &focused) == .success,
+       let fw = focused {
+        let win = fw as! AXUIElement
+        applyAXTimeout(win)
+        return (win, axGetString(win, "AXTitle") ?? "", frontApp.processIdentifier)
+    }
+
+    var main: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appEl, "AXMainWindow" as CFString, &main) == .success,
+       let mw = main {
+        let win = mw as! AXUIElement
+        applyAXTimeout(win)
+        return (win, axGetString(win, "AXTitle") ?? "", frontApp.processIdentifier)
+    }
+
+    return nil
+}
+
 // MARK: - CDP Helpers
 
 func httpGetJSON(_ urlString: String, timeout: TimeInterval = 3.0) -> Any? {
@@ -440,6 +497,14 @@ func tryFetchCodeServerTargets(port: Int) -> [[String: Any]]? {
         guard (target["type"] as? String) == "page" else { return false }
         let urlStr = (target["url"] as? String) ?? ""
         return urlStr.contains("?folder=") || urlStr.contains("?workspace=")
+    }
+}
+
+func tryFetchVivaldiWindowTargets(port: Int) -> [[String: Any]]? {
+    guard let json = httpGetJSON("http://localhost:\(port)/json/list") as? [[String: Any]]
+    else { return nil }
+    return json.filter { target in
+        ((target["url"] as? String) ?? "").contains("window.html")
     }
 }
 
@@ -519,6 +584,92 @@ func newWebSocket(_ urlStr: String) -> URLSessionWebSocketTask? {
     let task = URLSession.shared.webSocketTask(with: url)
     task.resume()
     return task
+}
+
+// MARK: - Vivaldi Tab Bar (via window.html CDP target)
+
+struct VivaldiTabBarState {
+    let width: Int
+    let position: String
+    let handleX: Double
+    let handleY: Double
+}
+
+func readVivaldiTabBarState(_ task: URLSessionWebSocketTask) -> VivaldiTabBarState? {
+    let raw = evalJS(task, """
+    (() => {
+        const c = document.querySelector('#tabs-tabbar-container');
+        const bar = document.querySelector('.SlideBar');
+        const browser = document.querySelector('#browser');
+        let pos = 'unknown';
+        if (browser) {
+            const m = browser.className.match(/tabs-(left|right|top|bottom)/);
+            if (m) pos = m[1];
+        }
+        if (!c || !bar) return JSON.stringify(null);
+        const cr = c.getBoundingClientRect();
+        const br = bar.getBoundingClientRect();
+        return JSON.stringify({ width: Math.round(cr.width), position: pos, hx: br.x + br.width / 2, hy: br.y + br.height / 2 });
+    })()
+    """)
+    guard let data = raw.data(using: .utf8),
+          let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let width = dict["width"] as? Int,
+          let position = dict["position"] as? String,
+          let hx = dict["hx"] as? Double,
+          let hy = dict["hy"] as? Double
+    else { return nil }
+    return VivaldiTabBarState(width: width, position: position, handleX: hx, handleY: hy)
+}
+
+func cdpInputMouseEvent(_ task: URLSessionWebSocketTask, _ id: Int, _ type: String, _ x: Double, _ y: Double, _ button: String, _ buttons: Int, _ clickCount: Int) {
+    let obj: [String: Any] = [
+        "id": id,
+        "method": "Input.dispatchMouseEvent",
+        "params": ["type": type, "x": x, "y": y, "button": button, "buttons": buttons, "clickCount": clickCount]
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: obj),
+          let str = String(data: data, encoding: .utf8)
+    else { return }
+    _ = wsSend(task, str, waitForId: id)
+}
+
+func resizeVivaldiTabBar(_ task: URLSessionWebSocketTask, targetWidth: Int) -> Bool {
+    guard let state = readVivaldiTabBarState(task) else {
+        fputs("    tab bar not visible or resize handle missing\n", stderr)
+        return false
+    }
+    guard state.position == "left" || state.position == "right" else {
+        fputs("    tab bar is not vertical (position=\(state.position))\n", stderr)
+        return false
+    }
+
+    let dx = targetWidth - state.width
+    if dx == 0 {
+        print("    tab bar already at \(state.width)px")
+        return true
+    }
+
+    let endX = state.position == "right" ? state.handleX - Double(dx) : state.handleX + Double(dx)
+    let y = state.handleY
+
+    var id = 200
+    cdpInputMouseEvent(task, id, "mouseMoved", state.handleX, y, "none", 0, 0); id += 1
+    cdpInputMouseEvent(task, id, "mousePressed", state.handleX, y, "left", 1, 1); id += 1
+    let steps = 12
+    for i in 1...steps {
+        let ix = state.handleX + (endX - state.handleX) * Double(i) / Double(steps)
+        cdpInputMouseEvent(task, id, "mouseMoved", ix, y, "left", 1, 0); id += 1
+        Thread.sleep(forTimeInterval: 0.015)
+    }
+    cdpInputMouseEvent(task, id, "mouseReleased", endX, y, "left", 0, 1); id += 1
+    Thread.sleep(forTimeInterval: 0.2)
+
+    if let after = readVivaldiTabBarState(task) {
+        print("    tab bar width: \(state.width)px → \(after.width)px")
+        return abs(after.width - targetWidth) <= 2
+    }
+    return true
 }
 
 // MARK: - Restore Eligibility
@@ -1395,6 +1546,159 @@ func cmdRestoreCodeServerLayout(port: Int) {
     }
 }
 
+// MARK: - Save Vivaldi
+
+func cmdSaveVivaldi(port: Int) {
+    var tabBarWidth: Int?
+    var tabBarPosition: String?
+
+    if let targets = tryFetchVivaldiWindowTargets(port: port),
+       let t = targets.first,
+       let wsUrl = t["webSocketDebuggerUrl"] as? String,
+       let task = newWebSocket(wsUrl) {
+        if let state = readVivaldiTabBarState(task) {
+            if state.position == "left" || state.position == "right" {
+                tabBarWidth = state.width
+                tabBarPosition = state.position
+            }
+        }
+        task.cancel(with: .normalClosure, reason: nil)
+    }
+
+    var winInfo: WindowInfo?
+    if let (win, title, pid) = findFrontmostVivaldiWindow(),
+       let pos = axGetPoint(win, "AXPosition"),
+       let size = axGetSize(win, "AXSize") {
+        let (screenFrame, relX, relY) = describeScreen(containing: pos)
+        winInfo = WindowInfo(
+            title: title,
+            pid: pid,
+            x: Double(pos.x),
+            y: Double(pos.y),
+            width: Double(size.width),
+            height: Double(size.height),
+            screenFrame: screenFrame,
+            screenRelativeX: relX,
+            screenRelativeY: relY,
+            label: title
+        )
+    }
+
+    if tabBarWidth == nil && winInfo == nil {
+        fputs("Skipping save-vivaldi: no Vivaldi window or vertical tab bar found.\n", stderr)
+        return
+    }
+
+    let fingerPrint = displayFingerprint()
+    var store = loadConfigStore()
+    var entry = store[fingerPrint] ?? DisplayConfig(window: nil, layout: nil)
+    var v = entry.vivaldi ?? VivaldiConfig()
+    if let w = tabBarWidth { v.tabBarWidth = w }
+    if let p = tabBarPosition { v.tabBarPosition = p }
+    if let wi = winInfo { v.window = wi }
+    entry.vivaldi = v
+    store[fingerPrint] = entry
+    guard saveConfigStore(store) else { exit(1) }
+
+    print("Saved Vivaldi → \(CONFIG_PATH)")
+    if let w = tabBarWidth, let p = tabBarPosition {
+        print("  tab bar:  \(w)px (\(p))")
+    }
+    if let wi = winInfo {
+        print("  window:   pos=(\(Int(wi.x)), \(Int(wi.y)))  size=\(Int(wi.width))x\(Int(wi.height))")
+    }
+}
+
+// MARK: - Restore Vivaldi
+
+func cmdRestoreVivaldi(port: Int) {
+    let store = loadConfigStore()
+    guard !store.isEmpty else {
+        fputs("Skipping restore-vivaldi: no saved data at \(CONFIG_PATH).\n", stderr)
+        return
+    }
+
+    let fingerPrint = displayFingerprint()
+
+    let vivaldi: VivaldiConfig
+    if let match = store[fingerPrint]?.vivaldi {
+        vivaldi = match
+    } else if store.count == 1, let only = store.values.first?.vivaldi {
+        fputs("No saved Vivaldi config for current display layout; using the only available saved config.\n", stderr)
+        print("\nCurrent layout:\n\(fingerPrint)\n")
+        vivaldi = only
+    } else {
+        fputs("Skipping restore-vivaldi: no saved Vivaldi config for current display layout.\n", stderr)
+        return
+    }
+
+    if let target = vivaldi.window {
+        let current = findVivaldiWindows()
+        guard !current.isEmpty else {
+            fputs("Skipping restore-vivaldi window: no Vivaldi windows currently open.\n", stderr)
+            return
+        }
+
+        let resolvedPos = resolveGlobalPosition(from: target)
+        let fallbackPos = CGPoint(x: target.x, y: target.y)
+        let globalPos = isPositionOnScreen(resolvedPos) ? resolvedPos : fallbackPos
+
+        print("Applying Vivaldi window to \(current.count) open window(s):")
+        print("  target: pos=(\(Int(globalPos.x)), \(Int(globalPos.y)))  size=\(Int(target.width))x\(Int(target.height))\n")
+
+        for i in 0..<current.count {
+            let (win, _, _, _) = current[i]
+            print("[\(i+1)]")
+
+            if isFullScreen(win) {
+                print("    full-screen detected, exiting...")
+                exitFullScreen(win)
+            }
+
+            let maxRetries = 5
+            var ok = false
+            for attempt in 1...maxRetries {
+                axSetPoint(win, "AXPosition", globalPos)
+                axSetSize(win, "AXSize", CGSize(width: target.width, height: target.height))
+
+                Thread.sleep(forTimeInterval: attempt == 1 ? 0.15 : 0.2)
+
+                if let newPos = axGetPoint(win, "AXPosition"),
+                   let newSize = axGetSize(win, "AXSize") {
+                    let posOk = abs(newPos.x - globalPos.x) < 3 && abs(newPos.y - globalPos.y) < 3
+                    let sizeOk = abs(newSize.width - CGFloat(target.width)) < 3 && abs(newSize.height - CGFloat(target.height)) < 3
+                    let status = (posOk && sizeOk) ? "OK" : "RETRY"
+                    print("    #\(attempt): pos=(\(Int(newPos.x)), \(Int(newPos.y)))  size=\(Int(newSize.width))x\(Int(newSize.height))  [\(status)]")
+                    if posOk && sizeOk {
+                        ok = true
+                        break
+                    }
+                } else {
+                    print("    #\(attempt): could not read back")
+                }
+            }
+            if !ok {
+                print("    FAILED after \(maxRetries) attempts")
+            }
+            print("")
+        }
+    }
+
+    if let targetWidth = vivaldi.tabBarWidth,
+       let targets = tryFetchVivaldiWindowTargets(port: port) {
+        print("Restoring Vivaldi tab bar to \(targetWidth)px across \(targets.count) window(s):")
+        for (idx, t) in targets.enumerated() {
+            guard let wsUrl = t["webSocketDebuggerUrl"] as? String,
+                  let task = newWebSocket(wsUrl)
+            else { continue }
+            print("[\(idx)]")
+            _ = resizeVivaldiTabBar(task, targetWidth: targetWidth)
+            task.cancel(with: .normalClosure, reason: nil)
+        }
+        print("")
+    }
+}
+
 // MARK: - Save All
 
 func runSubCommand(_ args: [String]) -> Int32 {
@@ -1416,7 +1720,10 @@ func cmdSaveAll(port: Int) {
     print("")
     print("=== save-codeserver-layout ===")
     let cr = runSubCommand(["save-codeserver-layout", String(CODESERVER_PORT)])
-    if lr != 0 || wr != 0 || cr != 0 { exit(1) }
+    print("")
+    print("=== save-vivaldi ===")
+    let vr = runSubCommand(["save-vivaldi", String(CODESERVER_PORT)])
+    if lr != 0 || wr != 0 || cr != 0 || vr != 0 { exit(1) }
 }
 
 // MARK: - Restore All
@@ -1430,9 +1737,13 @@ func cmdRestoreAll(port: Int) {
     let lr = runSubCommand(["restore-layout", String(port)])
     print("")
     Thread.sleep(forTimeInterval: 0.5)
+    print("=== restore-vivaldi ===")
+    let vr = runSubCommand(["restore-vivaldi", String(CODESERVER_PORT)])
+    print("")
+    Thread.sleep(forTimeInterval: 0.5)
     print("=== restore-codeserver-layout ===")
     let cr = runSubCommand(["restore-codeserver-layout", String(CODESERVER_PORT)])
-    if wr != 0 || lr != 0 || cr != 0 { exit(1) }
+    if wr != 0 || lr != 0 || vr != 0 || cr != 0 { exit(1) }
 }
 
 // MARK: - List Displays
@@ -1459,6 +1770,8 @@ func usage() -> Never {
     print("  \(prog) restore-layout [port]  Restore saved panel/sidebar layout to all VS Code windows")
     print("  \(prog) save-codeserver-layout [port]   Save layout of the active code-server tab in Chrome")
     print("  \(prog) restore-codeserver-layout [port]  Restore layout to all code-server tabs")
+    print("  \(prog) save-vivaldi [port]    Save Vivaldi tab-bar width & window geometry")
+    print("  \(prog) restore-vivaldi [port] Restore Vivaldi tab-bar width & window geometry")
     print("  \(prog) save-all [port]        Save both window and layout in one call")
     print("  \(prog) restore-all [port]     Restore window then layout with proper timing")
     print("  \(prog) list-displays          List connected displays with their frames")
@@ -1495,6 +1808,10 @@ case "save-codeserver-layout":
     cmdSaveCodeServerLayout(port: codeServerPort())
 case "restore-codeserver-layout":
     cmdRestoreCodeServerLayout(port: codeServerPort())
+case "save-vivaldi":
+    cmdSaveVivaldi(port: codeServerPort())
+case "restore-vivaldi":
+    cmdRestoreVivaldi(port: codeServerPort())
 case "save-all":
     cmdSaveAll(port: cdpPort())
 case "restore-all":
