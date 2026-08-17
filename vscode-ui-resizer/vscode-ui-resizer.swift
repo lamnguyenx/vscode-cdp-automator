@@ -60,6 +60,8 @@ struct VivaldiConfig: Codable {
     var tabBarWidth: Int?
     var tabBarPosition: String?
     var window: WindowInfo?
+    var uiZoom: Double?
+    var defaultZoom: Double?
 }
 
 struct DisplayConfig: Codable {
@@ -558,7 +560,7 @@ func evalJS(_ task: URLSessionWebSocketTask, _ expression: String) -> String {
     let reqObj: [String: Any] = [
         "id": 99,
         "method": "Runtime.evaluate",
-        "params": ["expression": expression, "returnByValue": true]
+        "params": ["expression": expression, "returnByValue": true, "awaitPromise": true]
     ]
     guard let reqData = try? JSONSerialization.data(withJSONObject: reqObj),
           let reqStr = String(data: reqData, encoding: .utf8)
@@ -670,6 +672,49 @@ func resizeVivaldiTabBar(_ task: URLSessionWebSocketTask, targetWidth: Int) -> B
         return abs(after.width - targetWidth) <= 2
     }
     return true
+}
+
+// MARK: - Vivaldi Zoom (via window.html CDP target)
+
+func readVivaldiUIZoom(_ task: URLSessionWebSocketTask) -> Double? {
+    let raw = evalJS(task, "new Promise(r => window.vivaldi.zoom.getVivaldiUIZoom(x => r(JSON.stringify(x))))")
+    return Double(raw)
+}
+
+func readVivaldiDefaultZoom(_ task: URLSessionWebSocketTask) -> Double? {
+    let raw = evalJS(task, "new Promise(r => window.vivaldi.zoom.getDefaultZoom(x => r(JSON.stringify(x))))")
+    return Double(raw)
+}
+
+func setVivaldiUIZoom(_ task: URLSessionWebSocketTask, _ factor: Double) {
+    _ = evalJS(task, "new Promise(r => window.vivaldi.zoom.setVivaldiUIZoom(\(factor), () => r('ok')))")
+}
+
+func setVivaldiDefaultZoom(_ task: URLSessionWebSocketTask, _ factor: Double) {
+    _ = evalJS(task, "new Promise(r => window.vivaldi.zoom.setDefaultZoom(\(factor), () => r('ok')))")
+}
+
+func vivaldiTabIDs(_ task: URLSessionWebSocketTask) -> [Int] {
+    let raw = evalJS(task, """
+    new Promise(r => chrome.tabs.query({}, t => r(JSON.stringify(t.map(x => x.id)))))
+    """)
+    guard let data = raw.data(using: .utf8),
+          let ids = try? JSONDecoder().decode([Int].self, from: data)
+    else { return [] }
+    return ids
+}
+
+func readVivaldiTabZoom(_ task: URLSessionWebSocketTask, _ tabId: Int) -> Double? {
+    let raw = evalJS(task, "new Promise(r => chrome.tabs.getZoom(\(tabId), f => r(JSON.stringify(f))))")
+    return Double(raw)
+}
+
+func setVivaldiTabZoom(_ task: URLSessionWebSocketTask, _ tabId: Int, _ factor: Double) -> Bool {
+    _ = evalJS(task, "new Promise(r => chrome.tabs.setZoom(\(tabId), \(factor), () => r('ok')))")
+    if let after = readVivaldiTabZoom(task, tabId) {
+        return abs(after - factor) < 0.01
+    }
+    return false
 }
 
 // MARK: - Restore Eligibility
@@ -1699,6 +1744,96 @@ func cmdRestoreVivaldi(port: Int) {
     }
 }
 
+// MARK: - Save Vivaldi Zoom
+
+func cmdSaveVivaldiZoom(port: Int) {
+    guard let targets = tryFetchVivaldiWindowTargets(port: port),
+          let t = targets.first,
+          let wsUrl = t["webSocketDebuggerUrl"] as? String,
+          let task = newWebSocket(wsUrl)
+    else {
+        fputs("Skipping save-vivaldi-zoom: cannot reach Vivaldi window.html on CDP port \(port).\n", stderr)
+        return
+    }
+    defer { task.cancel(with: .normalClosure, reason: nil) }
+
+    guard let uiZoom = readVivaldiUIZoom(task),
+          let defaultZoom = readVivaldiDefaultZoom(task)
+    else {
+        fputs("Skipping save-vivaldi-zoom: could not read zoom values from Vivaldi.\n", stderr)
+        return
+    }
+
+    let fingerPrint = displayFingerprint()
+    var store = loadConfigStore()
+    var entry = store[fingerPrint] ?? DisplayConfig(window: nil, layout: nil)
+    var v = entry.vivaldi ?? VivaldiConfig()
+    v.uiZoom = uiZoom
+    v.defaultZoom = defaultZoom
+    entry.vivaldi = v
+    store[fingerPrint] = entry
+    guard saveConfigStore(store) else { exit(1) }
+
+    print("Saved Vivaldi zoom → \(CONFIG_PATH)")
+    print("  UI zoom:      \(Int((uiZoom * 100).rounded()))%")
+    print("  default zoom: \(Int((defaultZoom * 100).rounded()))%")
+}
+
+// MARK: - Restore Vivaldi Zoom
+
+func cmdRestoreVivaldiZoom(port: Int) {
+    let store = loadConfigStore()
+    guard !store.isEmpty else {
+        fputs("Skipping restore-vivaldi-zoom: no saved data at \(CONFIG_PATH).\n", stderr)
+        return
+    }
+
+    let fingerPrint = displayFingerprint()
+
+    let vivaldi: VivaldiConfig
+    if let match = store[fingerPrint]?.vivaldi {
+        vivaldi = match
+    } else if store.count == 1, let only = store.values.first?.vivaldi {
+        fputs("No saved Vivaldi config for current display layout; using the only available saved config.\n", stderr)
+        print("\nCurrent layout:\n\(fingerPrint)\n")
+        vivaldi = only
+    } else {
+        fputs("Skipping restore-vivaldi-zoom: no saved Vivaldi config for current display layout.\n", stderr)
+        return
+    }
+
+    guard let targets = tryFetchVivaldiWindowTargets(port: port),
+          let t = targets.first,
+          let wsUrl = t["webSocketDebuggerUrl"] as? String,
+          let task = newWebSocket(wsUrl)
+    else {
+        fputs("Skipping restore-vivaldi-zoom: cannot reach Vivaldi window.html on CDP port \(port).\n", stderr)
+        return
+    }
+    defer { task.cancel(with: .normalClosure, reason: nil) }
+
+    if let uiZoom = vivaldi.uiZoom {
+        setVivaldiUIZoom(task, uiZoom)
+        Thread.sleep(forTimeInterval: 0.3)
+        let ok = readVivaldiUIZoom(task).map { abs($0 - uiZoom) < 0.01 } ?? false
+        print("UI zoom: \(Int((uiZoom * 100).rounded()))%  \(ok ? "OK" : "FAILED")")
+    }
+
+    if let defaultZoom = vivaldi.defaultZoom {
+        setVivaldiDefaultZoom(task, defaultZoom)
+        Thread.sleep(forTimeInterval: 0.3)
+        let ok = readVivaldiDefaultZoom(task).map { abs($0 - defaultZoom) < 0.01 } ?? false
+        print("Default zoom: \(Int((defaultZoom * 100).rounded()))%  \(ok ? "OK" : "FAILED")")
+
+        let tabIDs = vivaldiTabIDs(task)
+        print("Applying default zoom to \(tabIDs.count) tab(s):")
+        for (i, tabId) in tabIDs.enumerated() {
+            let ok = setVivaldiTabZoom(task, tabId, defaultZoom)
+            print("  [\(i + 1)] tab \(tabId): \(ok ? "OK" : "FAILED")")
+        }
+    }
+}
+
 // MARK: - Save All
 
 func runSubCommand(_ args: [String]) -> Int32 {
@@ -1723,7 +1858,10 @@ func cmdSaveAll(port: Int) {
     print("")
     print("=== save-vivaldi ===")
     let vr = runSubCommand(["save-vivaldi", String(CODESERVER_PORT)])
-    if lr != 0 || wr != 0 || cr != 0 || vr != 0 { exit(1) }
+    print("")
+    print("=== save-vivaldi-zoom ===")
+    let zr = runSubCommand(["save-vivaldi-zoom", String(CODESERVER_PORT)])
+    if lr != 0 || wr != 0 || cr != 0 || vr != 0 || zr != 0 { exit(1) }
 }
 
 // MARK: - Restore All
@@ -1741,9 +1879,13 @@ func cmdRestoreAll(port: Int) {
     let vr = runSubCommand(["restore-vivaldi", String(CODESERVER_PORT)])
     print("")
     Thread.sleep(forTimeInterval: 0.5)
+    print("=== restore-vivaldi-zoom ===")
+    let zr = runSubCommand(["restore-vivaldi-zoom", String(CODESERVER_PORT)])
+    print("")
+    Thread.sleep(forTimeInterval: 0.5)
     print("=== restore-codeserver-layout ===")
     let cr = runSubCommand(["restore-codeserver-layout", String(CODESERVER_PORT)])
-    if wr != 0 || lr != 0 || vr != 0 || cr != 0 { exit(1) }
+    if wr != 0 || lr != 0 || vr != 0 || zr != 0 || cr != 0 { exit(1) }
 }
 
 // MARK: - List Displays
@@ -1772,6 +1914,8 @@ func usage() -> Never {
     print("  \(prog) restore-codeserver-layout [port]  Restore layout to all code-server tabs")
     print("  \(prog) save-vivaldi [port]    Save Vivaldi tab-bar width & window geometry")
     print("  \(prog) restore-vivaldi [port] Restore Vivaldi tab-bar width & window geometry")
+    print("  \(prog) save-vivaldi-zoom [port]    Save Vivaldi UI zoom & default page zoom")
+    print("  \(prog) restore-vivaldi-zoom [port] Restore Vivaldi UI zoom, default zoom, and apply it to all tabs")
     print("  \(prog) save-all [port]        Save both window and layout in one call")
     print("  \(prog) restore-all [port]     Restore window then layout with proper timing")
     print("  \(prog) list-displays          List connected displays with their frames")
@@ -1812,6 +1956,10 @@ case "save-vivaldi":
     cmdSaveVivaldi(port: codeServerPort())
 case "restore-vivaldi":
     cmdRestoreVivaldi(port: codeServerPort())
+case "save-vivaldi-zoom":
+    cmdSaveVivaldiZoom(port: codeServerPort())
+case "restore-vivaldi-zoom":
+    cmdRestoreVivaldiZoom(port: codeServerPort())
 case "save-all":
     cmdSaveAll(port: cdpPort())
 case "restore-all":
