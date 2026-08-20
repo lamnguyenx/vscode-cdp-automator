@@ -581,6 +581,18 @@ func enableRuntime(_ task: URLSessionWebSocketTask) {
     _ = wsSend(task, "{\"id\":0,\"method\":\"Runtime.enable\"}", waitForId: 0)
 }
 
+func cdpSendMethod(_ task: URLSessionWebSocketTask, _ id: Int, _ method: String, _ params: [String: Any] = [:]) {
+    let obj: [String: Any] = ["id": id, "method": method, "params": params]
+    guard let data = try? JSONSerialization.data(withJSONObject: obj),
+          let str = String(data: data, encoding: .utf8)
+    else { return }
+    _ = wsSend(task, str, waitForId: id)
+}
+
+func bringTabToFront(_ task: URLSessionWebSocketTask) {
+    cdpSendMethod(task, 301, "Page.bringToFront")
+}
+
 func newWebSocket(_ urlStr: String) -> URLSessionWebSocketTask? {
     guard let url = URL(string: urlStr) else { return nil }
     let task = URLSession.shared.webSocketTask(with: url)
@@ -715,6 +727,57 @@ func setVivaldiTabZoom(_ task: URLSessionWebSocketTask, _ tabId: Int, _ factor: 
         return abs(after - factor) < 0.01
     }
     return false
+}
+
+// MARK: - Vivaldi Tab Numbers (via window.html CDP target)
+
+let VIVALDI_TAB_NUMBER_STYLE = """
+.tab-strip { counter-reset: tabidx; }
+.tab-strip .tab-position { counter-increment: tabidx; }
+.tab-strip .tab-position .title::before { content: counter(tabidx) ". "; margin-right: 5px; font-weight: 700; color: #8b8b8b; }
+""".trimmingCharacters(in: .whitespacesAndNewlines)
+
+func jsStringLiteral(_ s: String) -> String {
+    let data = try! JSONSerialization.data(withJSONObject: [s])
+    var str = String(data: data, encoding: .utf8)!
+    str.removeFirst()
+    str.removeLast()
+    return str
+}
+
+func enableVivaldiTabNumbers(port: Int) -> Bool {
+    guard let targets = tryFetchVivaldiWindowTargets(port: port), !targets.isEmpty else {
+        fputs("Skipping tab numbers: no Vivaldi window.html target on CDP port \(port).\n", stderr)
+        return false
+    }
+
+    var allOk = true
+    for (idx, t) in targets.enumerated() {
+        guard let wsUrl = t["webSocketDebuggerUrl"] as? String,
+              let task = newWebSocket(wsUrl)
+        else { continue }
+
+        let expr = """
+        (() => {
+            let el = document.getElementById('tab-order-numbers');
+            if (!el) { el = document.createElement('style'); el.id = 'tab-order-numbers'; document.head.appendChild(el); }
+            el.textContent = \(jsStringLiteral(VIVALDI_TAB_NUMBER_STYLE));
+            return document.getElementById('tab-order-numbers') ? 'ok' : 'fail';
+        })()
+        """
+        let raw = evalJS(task, expr)
+        task.cancel(with: .normalClosure, reason: nil)
+
+        let ok = raw == "ok"
+        print("[\(idx)] tab numbers: \(ok ? "on" : "FAILED")")
+        if !ok { allOk = false }
+    }
+    return allOk
+}
+
+func cmdVivaldiTabNumbers(port: Int) {
+    if enableVivaldiTabNumbers(port: port) { exit(0) }
+    exit(1)
 }
 
 // MARK: - Restore Eligibility
@@ -1254,30 +1317,85 @@ func dragSashVertical(_ task: URLSessionWebSocketTask, sashIdx: Int, dy: Int) {
     """)
 }
 
-func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: String) {
+func elapsed(_ t0: Date) -> String {
+    return String(format: "%.2fs", Date().timeIntervalSince(t0))
+}
+
+func nowStamp() -> String {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss.SSS"
+    return f.string(from: Date())
+}
+
+func stageLog(_ t0: Date, _ name: String) {
+    print("\n[\(nowStamp()) +\(elapsed(t0))] === \(name) ===")
+    fflush(stdout)
+}
+
+func waitForWorkbenchReady(_ task: URLSessionWebSocketTask, _ prefix: String) -> Bool {
+    let t0 = Date()
+    for i in 1...20 {
+        let raw = evalJS(task, """
+        (() => {
+            const wb = document.querySelector('.monaco-workbench');
+            if (!wb) return 'missing';
+            const r = wb.getBoundingClientRect();
+            if (r.width === 0 && r.height === 0) return 'zero';
+            return 'ready';
+        })()
+        """)
+        if raw == "ready" {
+            print("\(prefix)  waitForWorkbenchReady: ready after \(elapsed(t0))")
+            return true
+        }
+        if i == 1 || i % 5 == 0 {
+            print("\(prefix)  waitForWorkbenchReady: not ready (\(raw)) after \(elapsed(t0)), waiting...")
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+    print("\(prefix)  waitForWorkbenchReady: NEVER ready after \(elapsed(t0))")
+    return false
+}
+
+func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: String, bringToFront: Bool = false) {
+    let tStart = Date()
     let prefix = label.isEmpty ? "" : "[\(label)] "
     guard let task = newWebSocket(wsUrl) else { return }
     defer { task.cancel(with: .normalClosure, reason: nil) }
+    print("\(prefix)  connect: \(elapsed(tStart))")
+
+    if bringToFront {
+        bringTabToFront(task)
+        print("\(prefix)  bringToFront: \(elapsed(tStart))")
+    }
+
+    if !waitForWorkbenchReady(task, prefix) {
+        print("\(prefix)workbench never became ready (lazy-loaded/suspended tab), skipping after \(elapsed(tStart))")
+        return
+    }
 
     let panelPos = readPanelPosition(task)
+    print("\(prefix)  panelPos(\(panelPos)): \(elapsed(tStart))")
 
     if let el = readEligibility(task) {
         if el.maximized {
-            print("\(prefix)panel is maximized (full-width) — skipping this window")
+            print("\(prefix)panel is maximized (full-width) — skipping this window after \(elapsed(tStart))")
             return
         }
         if !el.sidebarOnLeft {
-            print("\(prefix)primary sidebar not on the left — skipping this window")
+            print("\(prefix)primary sidebar not on the left — skipping this window after \(elapsed(tStart))")
             return
         }
         if !el.panelOnRight {
-            print("\(prefix)panel not on the right — skipping this window")
+            print("\(prefix)panel not on the right — skipping this window after \(elapsed(tStart))")
             return
         }
     }
+    print("\(prefix)  eligibility: \(elapsed(tStart))")
 
     let isBottom = panelPos == "bottom"
     let smap = isBottom ? solveSashMappingVertical(task) : solveSashMappingHorizontal(task)
+    print("\(prefix)  sash mapping: \(elapsed(tStart))")
     var seIdx = smap["sidebar_editor"]
     var epIdx = smap["editor_panel"]
 
@@ -1310,7 +1428,7 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
         consecutiveZeros = 0
 
         if attempt == 1 {
-            print("\(prefix)current: sb=\(sb) panel=\(pn) editor=\(ed)")
+            print("\(prefix)current: sb=\(sb) panel=\(pn) editor=\(ed) (after \(elapsed(tStart)))")
         }
 
         if !isBottom && pn == 0 && tPanel > 0 && smap["editor_panel"] == nil {
@@ -1342,6 +1460,7 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
             dx_s = tSidebar - sb
         }
 
+        let tDrag = Date()
         if dx_p != 0 {
             let sign = dx_p > 0 ? "+" : ""
             print("\(prefix) dragging panel sash by \(sign)\(dx_p)")
@@ -1357,6 +1476,7 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
             print("\(prefix) dragging sidebar sash by \(sign)\(dx_s)")
             dragSashHorizontal(task, sashIdx: seIdx!, dx: dx_s)
         }
+        print("\(prefix)  drag sent: \(elapsed(tDrag))")
 
         if dx_p == 0 && dx_s == 0 {
             print("\(prefix)already at target — OK")
@@ -1369,6 +1489,7 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
         } else {
             Thread.sleep(forTimeInterval: 0.6)
         }
+        print("\(prefix)  settled: \(elapsed(tDrag))")
 
         let final = readCurrent(task)
         let fsb = final["sidebar"] ?? 0
@@ -1386,6 +1507,8 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
             fpn = Int(rawH) ?? 0
         }
 
+        print("\(prefix)  verify: \(elapsed(tDrag))")
+
         ok = fsb == tSidebar && fpn == tPanel
         let status = ok ? "OK" : "RETRY"
         let dimLabel = isBottom ? "h" : ""
@@ -1396,6 +1519,7 @@ func restoreLayoutWindow(wsUrl: String, tSidebar: Int, tPanel: Int, label: Strin
     if !ok {
         print("\(prefix)FAILED after \(maxRetries) attempts")
     }
+    print("\(prefix)done in \(elapsed(tStart))")
 }
 
 func cmdRestoreLayout(port: Int) {
@@ -1444,21 +1568,34 @@ func cmdRestoreLayout(port: Int) {
         let gridLevel = zoomLevelFromPercent(roundedPct)
         print("Applying zoom \(Int(roundedPct))% (level \(String(format: "%.4f", gridLevel))) via \(USER_SETTINGS_PATH)")
         if writeZoomLevelToUserSettings(gridLevel) {
-            Thread.sleep(forTimeInterval: 1.0)
+            Thread.sleep(forTimeInterval: 0.3)
+            let zoomQueue = DispatchQueue.global(qos: .userInitiated)
+            let zoomGroup = DispatchGroup()
+            let zoomLock = NSLock()
+            var zoomResults: [Int: Bool] = [:]
             for (idx, t) in windows.enumerated() {
-                guard let wsUrl = t["webSocketDebuggerUrl"] as? String,
-                      let task = newWebSocket(wsUrl)
-                else { continue }
-                var zoomOk = false
-                for _ in 1...5 {
-                    if verifyZoomLevel(task, targetLevel: gridLevel) {
-                        zoomOk = true
-                        break
+                guard let wsUrl = t["webSocketDebuggerUrl"] as? String else { continue }
+                zoomGroup.enter()
+                zoomQueue.async {
+                    defer { zoomGroup.leave() }
+                    guard let task = newWebSocket(wsUrl) else { return }
+                    defer { task.cancel(with: .normalClosure, reason: nil) }
+                    var ok = false
+                    for _ in 1...3 {
+                        if verifyZoomLevel(task, targetLevel: gridLevel) {
+                            ok = true
+                            break
+                        }
+                        Thread.sleep(forTimeInterval: 0.3)
                     }
-                    Thread.sleep(forTimeInterval: 0.5)
+                    zoomLock.lock()
+                    zoomResults[idx] = ok
+                    zoomLock.unlock()
                 }
-                task.cancel(with: .normalClosure, reason: nil)
-                print("[\(idx)] zoom: \(zoomOk ? "OK" : "FAILED after 5 attempts")")
+            }
+            zoomGroup.wait()
+            for idx in windows.indices {
+                print("[\(idx)] zoom: \((zoomResults[idx] ?? false) ? "OK" : "FAILED after 3 attempts")")
             }
         }
         print("")
@@ -1581,13 +1718,44 @@ func cmdRestoreCodeServerLayout(port: Int) {
         return
     }
     print("Restoring \(targets.count) code-server tab(s) to sidebar=\(tSidebar)px  panel=\(tPanel)px\n")
+    let tCmd = Date()
+
+    var activeWSURL: String?
+    let activeLock = NSLock()
+    let activeGroup = DispatchGroup()
+    let activeQueue = DispatchQueue.global(qos: .userInitiated)
+    for t in targets {
+        guard let wsUrl = t["webSocketDebuggerUrl"] as? String else { continue }
+        activeGroup.enter()
+        activeQueue.async {
+            defer { activeGroup.leave() }
+            guard let task = newWebSocket(wsUrl) else { return }
+            let active = isActiveTab(task)
+            task.cancel(with: .normalClosure, reason: nil)
+            if active {
+                activeLock.lock()
+                if activeWSURL == nil { activeWSURL = wsUrl }
+                activeLock.unlock()
+            }
+        }
+    }
+    activeGroup.wait()
+    print("active-tab detection: \(elapsed(tCmd)) (active=\(activeWSURL == nil ? "none" : "found"))")
 
     for (idx, t) in targets.enumerated() {
         guard let wsUrl = t["webSocketDebuggerUrl"] as? String else { continue }
         let title = (t["title"] as? String) ?? "unknown"
-        print("[\(idx)] \(title)")
-        restoreLayoutWindow(wsUrl: wsUrl, tSidebar: tSidebar, tPanel: tPanel, label: "\(idx)")
+        let tTab = Date()
+        print("[\(idx)] \(title)  (starting at \(elapsed(tCmd)))")
+        restoreLayoutWindow(wsUrl: wsUrl, tSidebar: tSidebar, tPanel: tPanel, label: "\(idx)", bringToFront: true)
+        print("    tab total: \(elapsed(tTab))")
         print("")
+    }
+
+    if let activeWSURL, let task = newWebSocket(activeWSURL) {
+        bringTabToFront(task)
+        task.cancel(with: .normalClosure, reason: nil)
+        print("returned focus to active tab: \(elapsed(tCmd))")
     }
 }
 
@@ -1700,13 +1868,13 @@ func cmdRestoreVivaldi(port: Int) {
                 exitFullScreen(win)
             }
 
-            let maxRetries = 5
+            let maxRetries = 3
             var ok = false
             for attempt in 1...maxRetries {
                 axSetPoint(win, "AXPosition", globalPos)
                 axSetSize(win, "AXSize", CGSize(width: target.width, height: target.height))
 
-                Thread.sleep(forTimeInterval: attempt == 1 ? 0.15 : 0.2)
+                Thread.sleep(forTimeInterval: attempt == 1 ? 0.1 : 0.15)
 
                 if let newPos = axGetPoint(win, "AXPosition"),
                    let newSize = axGetSize(win, "AXSize") {
@@ -1826,10 +1994,31 @@ func cmdRestoreVivaldiZoom(port: Int) {
         print("Default zoom: \(Int((defaultZoom * 100).rounded()))%  \(ok ? "OK" : "FAILED")")
 
         let tabIDs = vivaldiTabIDs(task)
-        print("Applying default zoom to \(tabIDs.count) tab(s):")
-        for (i, tabId) in tabIDs.enumerated() {
-            let ok = setVivaldiTabZoom(task, tabId, defaultZoom)
-            print("  [\(i + 1)] tab \(tabId): \(ok ? "OK" : "FAILED")")
+        guard !tabIDs.isEmpty else {
+            print("No Vivaldi tabs to apply zoom to.")
+            return
+        }
+        print("Applying default zoom to \(tabIDs.count) tab(s) (batched):")
+        let idsExpr = tabIDs.map(String.init).joined(separator: ",")
+        let raw = evalJS(task, """
+        new Promise(r => {
+            const ids = [\(idsExpr)];
+            Promise.all(ids.map(id => new Promise(res => chrome.tabs.setZoom(id, \(defaultZoom), () => res(id)))))
+                .then(() => Promise.all(ids.map(id => new Promise(res => chrome.tabs.getZoom(id, f => res([id, f]))))))
+                .then(rs => r(JSON.stringify(rs)));
+        })
+        """)
+        guard let data = raw.data(using: .utf8),
+              let pairs = try? JSONSerialization.jsonObject(with: data) as? [[Any]]
+        else {
+            print("  batch zoom failed (unparseable result)")
+            return
+        }
+        for (i, pair) in pairs.enumerated() {
+            let id = pair.first as? Int ?? -1
+            let f = pair.last as? Double ?? 0
+            let good = abs(f - defaultZoom) < 0.01
+            print("  [\(i + 1)] tab \(id): \(good ? "OK" : "FAILED")")
         }
     }
 }
@@ -1862,30 +2051,40 @@ func cmdSaveAll(port: Int) {
     print("=== save-vivaldi-zoom ===")
     let zr = runSubCommand(["save-vivaldi-zoom", String(CODESERVER_PORT)])
     if lr != 0 || wr != 0 || cr != 0 || vr != 0 || zr != 0 { exit(1) }
+
+    print("")
+    print("=== vivaldi-tab-numbers ===")
+    _ = runSubCommand(["vivaldi-tab-numbers", String(CODESERVER_PORT)])
 }
 
 // MARK: - Restore All
 
 func cmdRestoreAll(port: Int) {
-    print("=== restore-win ===")
+    let t0 = Date()
+    stageLog(t0, "restore-win")
     let wr = runSubCommand(["restore-win", String(port)])
     print("")
-    Thread.sleep(forTimeInterval: 0.5)
-    print("=== restore-layout ===")
+    Thread.sleep(forTimeInterval: 0.1)
+    stageLog(t0, "restore-layout")
     let lr = runSubCommand(["restore-layout", String(port)])
     print("")
-    Thread.sleep(forTimeInterval: 0.5)
-    print("=== restore-vivaldi ===")
+    Thread.sleep(forTimeInterval: 0.1)
+    stageLog(t0, "restore-vivaldi")
     let vr = runSubCommand(["restore-vivaldi", String(CODESERVER_PORT)])
     print("")
-    Thread.sleep(forTimeInterval: 0.5)
-    print("=== restore-vivaldi-zoom ===")
+    Thread.sleep(forTimeInterval: 0.1)
+    stageLog(t0, "restore-vivaldi-zoom")
     let zr = runSubCommand(["restore-vivaldi-zoom", String(CODESERVER_PORT)])
     print("")
-    Thread.sleep(forTimeInterval: 0.5)
-    print("=== restore-codeserver-layout ===")
+    Thread.sleep(forTimeInterval: 0.1)
+    stageLog(t0, "restore-codeserver-layout")
     let cr = runSubCommand(["restore-codeserver-layout", String(CODESERVER_PORT)])
     if wr != 0 || lr != 0 || vr != 0 || zr != 0 || cr != 0 { exit(1) }
+
+    print("")
+    stageLog(t0, "vivaldi-tab-numbers")
+    _ = runSubCommand(["vivaldi-tab-numbers", String(CODESERVER_PORT)])
+    print("\n[\(nowStamp()) +\(elapsed(t0))] restore-all done")
 }
 
 // MARK: - List Displays
@@ -1916,6 +2115,7 @@ func usage() -> Never {
     print("  \(prog) restore-vivaldi [port] Restore Vivaldi tab-bar width & window geometry")
     print("  \(prog) save-vivaldi-zoom [port]    Save Vivaldi UI zoom & default page zoom")
     print("  \(prog) restore-vivaldi-zoom [port] Restore Vivaldi UI zoom, default zoom, and apply it to all tabs")
+    print("  \(prog) vivaldi-tab-numbers [port]  Enable tab order numbers in Vivaldi's tab bar")
     print("  \(prog) save-all [port]        Save both window and layout in one call")
     print("  \(prog) restore-all [port]     Restore window then layout with proper timing")
     print("  \(prog) list-displays          List connected displays with their frames")
@@ -1960,6 +2160,8 @@ case "save-vivaldi-zoom":
     cmdSaveVivaldiZoom(port: codeServerPort())
 case "restore-vivaldi-zoom":
     cmdRestoreVivaldiZoom(port: codeServerPort())
+case "vivaldi-tab-numbers":
+    cmdVivaldiTabNumbers(port: codeServerPort())
 case "save-all":
     cmdSaveAll(port: cdpPort())
 case "restore-all":

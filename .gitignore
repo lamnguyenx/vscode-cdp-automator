@@ -1,5 +1,8 @@
 *.exe
 
+# Temporary experiments / scratch data
+exp/
+
 # Created by https://www.toptal.com/developers/gitignore/api/python,swift
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,swift
 
