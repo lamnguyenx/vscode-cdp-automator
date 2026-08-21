@@ -1618,35 +1618,50 @@ func cmdSaveCodeServerLayout(port: Int) {
         return
     }
 
-    var active: [String: Any]?
-    var visible: [String: Any]?
-    var titles: [String] = []
+    let titles = targets.map { ($0["title"] as? String) ?? "unknown" }
 
-    for t in targets {
-        let title = (t["title"] as? String) ?? "unknown"
-        titles.append(title)
-        guard let wsUrl = t["webSocketDebuggerUrl"] as? String,
-              let task = newWebSocket(wsUrl)
-        else { continue }
-        let activeTab = isActiveTab(task)
-        let visibleTab = activeTab ? true : isVisibleTab(task)
-        task.cancel(with: .normalClosure, reason: nil)
-        if activeTab && active == nil {
-            active = t
-        }
-        if visibleTab && visible == nil {
-            visible = t
+    // Prefer the focused tab; use a single Vivaldi window.html connection with chrome.tabs
+    var chosen: [String: Any]?
+    if let winTargets = tryFetchVivaldiWindowTargets(port: port),
+       let t = winTargets.first,
+       let wsUrl = t["webSocketDebuggerUrl"] as? String,
+       let task = newWebSocket(wsUrl) {
+        let raw = evalJS(task, """
+        new Promise(r => chrome.tabs.query({active:true}, t => {
+            const cur = t.find(x => (x.url||'').includes('?folder=') || (x.url||'').includes('?workspace='));
+            const all = [];
+            chrome.tabs.query({}, a => {
+                all.push(...a.filter(x => (x.url||'').includes('?folder=') || (x.url||'').includes('?workspace=')));
+                r(JSON.stringify({ cur: cur?cur.id:null, ids: all.map(x=>x.id) }));
+            });
+        }))
+        """)
+        if let data = raw.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let curIdReal = obj["cur"] as? Int, curIdReal != -1 {
+                let curUrlRaw = evalJS(task, "new Promise(r => chrome.tabs.get(\(curIdReal), t => r(JSON.stringify(t.url||''))))")
+                if let curUrlData = curUrlRaw.data(using: .utf8),
+                   let url = try? JSONSerialization.jsonObject(with: curUrlData) as? String {
+                    chosen = targets.first(where: { (($0["url"] as? String) ?? "") == url })
+                }
+            }
+            task.cancel(with: .normalClosure, reason: nil)
+        } else {
+            task.cancel(with: .normalClosure, reason: nil)
         }
     }
+    if chosen == nil {
+        chosen = targets.first
+    }
 
-    guard let chosen = active ?? visible else {
+    guard chosen != nil else {
         fputs("Could not determine the active code-server tab.\n", stderr)
         fputs("Open tabs:\n", stderr)
         for title in titles { fputs("  - \(title)\n", stderr) }
         return
     }
 
-    guard let wsUrl = chosen["webSocketDebuggerUrl"] as? String,
+    guard let chosen2 = chosen, let wsUrl = chosen2["webSocketDebuggerUrl"] as? String,
           let task = newWebSocket(wsUrl)
     else {
         fputs("Could not connect to the active code-server tab.\n", stderr)
@@ -1654,7 +1669,7 @@ func cmdSaveCodeServerLayout(port: Int) {
     }
     defer { task.cancel(with: .normalClosure, reason: nil) }
 
-    let title = (chosen["title"] as? String) ?? "unknown"
+    let title = (chosen2["title"] as? String) ?? "unknown"
     print("Saving from (code-server): \(title)")
 
     guard let layout = readLayoutFromTab(task) else {
@@ -2036,25 +2051,27 @@ func runSubCommand(_ args: [String]) -> Int32 {
 }
 
 func cmdSaveAll(port: Int) {
-    print("=== save-layout ===")
+    let t0 = Date()
+    stageLog(t0, "save-layout")
     let lr = runSubCommand(["save-layout", String(port)])
     print("")
-    print("=== save-win ===")
+    stageLog(t0, "save-win")
     let wr = runSubCommand(["save-win"])
     print("")
-    print("=== save-codeserver-layout ===")
+    stageLog(t0, "save-codeserver-layout")
     let cr = runSubCommand(["save-codeserver-layout", String(CODESERVER_PORT)])
     print("")
-    print("=== save-vivaldi ===")
+    stageLog(t0, "save-vivaldi")
     let vr = runSubCommand(["save-vivaldi", String(CODESERVER_PORT)])
     print("")
-    print("=== save-vivaldi-zoom ===")
+    stageLog(t0, "save-vivaldi-zoom")
     let zr = runSubCommand(["save-vivaldi-zoom", String(CODESERVER_PORT)])
     if lr != 0 || wr != 0 || cr != 0 || vr != 0 || zr != 0 { exit(1) }
 
     print("")
-    print("=== vivaldi-tab-numbers ===")
+    stageLog(t0, "vivaldi-tab-numbers")
     _ = runSubCommand(["vivaldi-tab-numbers", String(CODESERVER_PORT)])
+    print("\n[\(nowStamp()) +\(elapsed(t0))] save-all done")
 }
 
 // MARK: - Restore All
