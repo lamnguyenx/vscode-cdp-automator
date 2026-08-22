@@ -82,7 +82,18 @@ onDefaultZoomChanged / onUIZoomChanged  // events
   per-tab zoom needs no second attachment. Per-tab zoom even works on Vivaldi's own
   `chrome-extension://` tabs.
 
-## 6. Miscellaneous
+## 6. Tab strip height / appearance (added 2026-08-22)
+
+See `docs/important/vivaldi-tab-strip-customization.md` and `docs/plans/2026/08/22/2026-08-22-vivaldi-tab-strip-height-title-split.md`.
+
+- `.tab-position` is absolute with inline `--Height:31px; --PositionY:N*31px` (via `SPAN` wrapper). Override with `> SPAN:nth-child(N) .tab-position { --PositionY: ... !important }` — `!important` beats inline.
+- `.resize` inline `max-height: n*32` is set by Vivaldi JS; stale after new tabs → scrollbar though space ample. Tighten one-shot `n*(NEW_H+1)`.
+- `max-height:none` on `.resize` makes it `1075px` and collapses `toolbar` to `3px` (new-tab button hidden at `y1113`).
+- `.tab` is column flex → `justify-content:center` centers taller tab content.
+- `progress.page-progress-indicator` (`absolute h2`) shows as dash in taller tabs — hide it.
+- `MutationObserver` with `subtree:true` while mutating `title.innerHTML` inside observed subtree → infinite loop → freeze (required `Page.reload`). Observe only `childList` on `.tab-strip`.
+
+## 7. Miscellaneous
 
 - `window.vivaldi.tabsPrivate` handles tab internals (`get`, `update`, `onPageZoom`, …
   ) but has **no** `setZoom`; use `chrome.tabs` for zoom.
@@ -101,3 +112,5 @@ onDefaultZoomChanged / onUIZoomChanged  // events
 - `docs/important/changing-vivaldi-zoom.md` — the zoom APIs in detail
 - `docs/important/changing-vivaldi-vertical-tab-bar-size.md` — tab-bar width, trusted drag
   mechanics
+- `docs/important/vivaldi-tab-strip-customization.md` — tab height/centering/numbering
+- `docs/plans/2026/08/22/2026-08-22-vivaldi-tab-strip-height-title-split.md` — trials & errors log
