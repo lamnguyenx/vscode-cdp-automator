@@ -82,16 +82,16 @@ onDefaultZoomChanged / onUIZoomChanged  // events
   per-tab zoom needs no second attachment. Per-tab zoom even works on Vivaldi's own
   `chrome-extension://` tabs.
 
-## 6. Tab strip height / appearance (added 2026-08-22)
+## 6. Tab strip height / appearance (added 2026-08-22, manual-rerun 2026-08-22)
 
 See `docs/important/vivaldi-tab-strip-customization.md` and `docs/plans/2026/08/22/2026-08-22-vivaldi-tab-strip-height-title-split.md`.
 
-- `.tab-position` is absolute with inline `--Height:31px; --PositionY:N*31px` (via `SPAN` wrapper). Override with `> SPAN:nth-child(N) .tab-position { --PositionY: ... !important }` — `!important` beats inline.
-- `.resize` inline `max-height: n*32` is set by Vivaldi JS; stale after new tabs → scrollbar though space ample. Tighten one-shot `n*(NEW_H+1)`.
+- `.tab-position` is absolute with inline `--Height:31px; --PositionY:N*31px` (via `SPAN` wrapper). Override via `pos.style.setProperty('--PositionY', ..., 'important')` — `!important` beats inline (previously `> SPAN:nth-child(N)` CSS).
+- `.resize` inline `max-height: n*32` is set by Vivaldi JS; stale after new tabs → scrollbar though space ample. Tighten one-shot `n*(NEW_H+1) + totalGaps*GAP` (`GAP=40`).
 - `max-height:none` on `.resize` makes it `1075px` and collapses `toolbar` to `3px` (new-tab button hidden at `y1113`).
 - `.tab` is column flex → `justify-content:center` centers taller tab content.
 - `progress.page-progress-indicator` (`absolute h2`) shows as dash in taller tabs — hide it.
-- `MutationObserver` with `subtree:true` while mutating `title.innerHTML` inside observed subtree → infinite loop → freeze (required `Page.reload`). Observe only `childList` on `.tab-strip`.
+- `MutationObserver` with `subtree:true` while mutating `title.innerHTML` inside observed subtree → infinite loop → freeze (required `Page.reload`). Previously mitigated with `childList` + debounce + `setInterval`, now removed entirely in favor of **manual rerun** (`node tools/vivaldi-title-split.mjs on` after new tabs/reorders). `on` now does one-shot `applyTabSplit()` and deletes any prior `window._tabSplitObserver`/`window._tabSplitInterval`.
 
 ## 7. Miscellaneous
 

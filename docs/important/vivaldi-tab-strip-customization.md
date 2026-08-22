@@ -55,33 +55,22 @@ document.querySelector('.tab-strip').parentElement.style.setProperty('max-height
 - Progress dash: hide `progress` (`display:none`), otherwise visible as strikethrough in taller tabs (`absolute y369 h2`).
 - Observer pitfall: `new MutationObserver(apply).observe(strip,{childList:true,subtree:true})` where `apply` does `t.innerHTML=...` inside `strip` subtree → infinite loop → browser freeze (`Runtime.evaluate` timeout, required `Page.reload` + `Target.closeTarget`).
 
-Safe (current): `childList+subtree+characterData` with disconnect/re-observe + `setInterval 800` fallback + `setProperty(...,'important')`:
-
-```js
-let debounce;
-const debounced = ()=>{clearTimeout(debounce); debounce=setTimeout(()=>{
-  observer.disconnect(); applyTabSplit();
-  observer.observe(strip,{childList:true,subtree:true,characterData:true});
-},300)};
-new MutationObserver(debounced).observe(strip,{childList:true,subtree:true,characterData:true});
-setInterval(applyTabSplit,800);
-newTabBtn.addEventListener('click',()=>setTimeout(applyTabSplit,300));
-```
+Previously "safe" was `childList+subtree+characterData` with disconnect/re-observe + `setInterval 800` fallback + `setProperty(...,'important')` + `newTab` click handler — still fragile and caused hangs on domain-gap reflows. **Current (2026-08-22): manual rerun only** — no `MutationObserver`/`setInterval`/`newtab` listener. `tools/vivaldi-title-split.mjs:155` does one-shot `applyTabSplit()` and cleans up any prior `window._tabSplitObserver`/`window._tabSplitInterval` without re-creating them. Re-run `node tools/vivaldi-title-split.mjs on` after new tabs, reorders, or title changes.
 
 ## Domain Grouping with Gaps
 
-- Group key: `txt.split(' - ')[0]` → ` APPLE`/`🌲PP`/`🍊 NUC`/`blank`. `GAP=16` (`<38`).
-- `PositionY = idx*38 + gapsBefore*16` (`!important`), `tab-gap` fake blank `div` (`h16, top = idx*38+offset-16, border-bottom:1px white`) inserted at each `group[i]!==group[i-1]` (cleared each run). `tab-position` gets `tab-group-end` for `::after` alternative (now unused, kept for `overflow:visible`).
-- `resize.max-height = n*39 + totalGaps*16` (tight, `1px` border per tab). `1px` CSS → `0.606px` computed at UI zoom `1.6` (`1/1.65`), matches tab default; `1.6px` gives `1px` on screen.
-- Example `9` tabs `APPLE3,PP5,NUC1` → `2` gaps at `114`/`320` `h16` as `tab-gap` fake tabs.
+- Group key: `txt.split(' - ')[0]` → ` APPLE`/`🌲PP`/`🍊 NUC`/`blank`. `GAP=40` (`>38`, one full blank-tab height).
+- `PositionY = idx*38 + gapsBefore*40` (`!important`), `tab-gap` fake blank `div` (`h40, top = idx*38+offset-40, border-bottom:1px white`) inserted at each `group[i]!==group[i-1]` (cleared each run). `tab-position` gets `tab-group-end` for `::after` alternative (now unused, kept for `overflow:visible`).
+- `resize.max-height = n*39 + totalGaps*40` (tight, `1px` border per tab). `1px` CSS → `0.606px` computed at UI zoom `1.6` (`1/1.65`), matches tab default; `1.6px` gives `1px` on screen.
+- Example `9` tabs `APPLE3,PP5,NUC1` → `2` gaps at `114`/`320` `h40` as `tab-gap` fake tabs.
 
 ## Tool
 
-`tools/vivaldi-title-split.mjs` injects `HEIGHT_CSS` (50 nth-child rules) + `STYLE` (hide favicon/audio/progress, center, number) + one-shot split/number/tighten + safe observer.
+`tools/vivaldi-title-split.mjs` injects `HEIGHT_CSS` (`--Height:38px !important`) + `STYLE` (hide favicon/audio/progress, center, number) + one-shot split/number/tighten + gap rendering. No auto observer — manual rerun.
 
 ```bash
-node tools/vivaldi-title-split.mjs on   # 38px, centered, 1.APPLE, no progress, auto on +
-node tools/vivaldi-title-split.mjs off  # restores titles, clears observer/resize
+node tools/vivaldi-title-split.mjs on   # 38px, centered, 1.APPLE, no progress, GAP 40, manual rerun
+node tools/vivaldi-title-split.mjs off  # restores titles, clears style/resize/observer remnants
 ```
 
 ## Gotchas

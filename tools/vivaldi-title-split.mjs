@@ -151,27 +151,9 @@ const apply = async (t) => {
         }
       };
       applyTabSplit();
+      // manual rerun only — clean up any previous auto observers/intervals
       if (window._tabSplitObserver) { window._tabSplitObserver.disconnect(); delete window._tabSplitObserver; }
       if (window._tabSplitInterval) { clearInterval(window._tabSplitInterval); delete window._tabSplitInterval; }
-      {
-        let debounce;
-        const debouncedApply = () => {
-          clearTimeout(debounce);
-          debounce = setTimeout(() => {
-            window._tabSplitObserver.disconnect();
-            applyTabSplit();
-            window._tabSplitObserver.observe(strip, {childList:true, subtree:true, characterData:true});
-          }, 300);
-        };
-        window._tabSplitObserver = new MutationObserver(debouncedApply);
-        window._tabSplitObserver.observe(strip, {childList:true, subtree:true, characterData:true});
-        window._tabSplitInterval = setInterval(applyTabSplit, 800);
-      }
-      const newTabBtn = document.querySelector('.toolbar.toolbar-tabbar-after .button-toolbar.newtab button');
-      if (newTabBtn && !newTabBtn._tabSplitWired) {
-        newTabBtn._tabSplitWired = true;
-        newTabBtn.addEventListener('click', () => setTimeout(applyTabSplit, 300));
-      }
       return 'ok';
     })()`);
     console.log(`${t.id.slice(0, 8)}: on`);
