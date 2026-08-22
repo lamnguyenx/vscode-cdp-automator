@@ -2050,6 +2050,35 @@ func runSubCommand(_ args: [String]) -> Int32 {
     return proc.terminationStatus
 }
 
+func repoRoot() -> String? {
+    let fm = FileManager.default
+    let exeDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
+    let candidates = [
+        fm.currentDirectoryPath,
+        exeDir.path,
+        exeDir.deletingLastPathComponent().path,
+    ]
+    return candidates.first { fm.fileExists(atPath: $0 + "/tools/vivaldi-title-split.mjs") }
+}
+
+func runNodeTool(_ args: [String]) -> Int32 {
+    fflush(stdout)
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    proc.arguments = ["node"] + args
+    try? proc.run()
+    proc.waitUntilExit()
+    return proc.terminationStatus
+}
+
+func runVivaldiTitleSplit() -> Int32 {
+    guard let root = repoRoot() else {
+        print("tools/vivaldi-title-split.mjs not found")
+        return 1
+    }
+    return runNodeTool([root + "/tools/vivaldi-title-split.mjs"])
+}
+
 func cmdSaveAll(port: Int) {
     let t0 = Date()
     stageLog(t0, "save-layout")
@@ -2069,8 +2098,8 @@ func cmdSaveAll(port: Int) {
     if lr != 0 || wr != 0 || cr != 0 || vr != 0 || zr != 0 { exit(1) }
 
     print("")
-    stageLog(t0, "vivaldi-tab-numbers")
-    _ = runSubCommand(["vivaldi-tab-numbers", String(CODESERVER_PORT)])
+    stageLog(t0, "vivaldi-title-split")
+    _ = runVivaldiTitleSplit()
     print("\n[\(nowStamp()) +\(elapsed(t0))] save-all done")
 }
 
@@ -2099,8 +2128,8 @@ func cmdRestoreAll(port: Int) {
     if wr != 0 || lr != 0 || vr != 0 || zr != 0 || cr != 0 { exit(1) }
 
     print("")
-    stageLog(t0, "vivaldi-tab-numbers")
-    _ = runSubCommand(["vivaldi-tab-numbers", String(CODESERVER_PORT)])
+    stageLog(t0, "vivaldi-title-split")
+    _ = runVivaldiTitleSplit()
     print("\n[\(nowStamp()) +\(elapsed(t0))] restore-all done")
 }
 
