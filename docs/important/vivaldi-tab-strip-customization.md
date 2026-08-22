@@ -52,17 +52,28 @@ document.querySelector('.tab-strip').parentElement.style.setProperty('max-height
 ## Numbering & Splitting Without Hanging
 
 - Number gap: `.tab-number { margin-right:0 }` (`1. ` → `1.`).
-- Progress dash: hide `progress` (`display:none`), otherwise visible as strikethrough in taller tabs.
-- Observer pitfall: `new MutationObserver(apply).observe(strip,{childList:true,subtree:true})` where `apply` does `t.innerHTML=...` inside `strip` subtree → infinite loop → browser freeze (`Runtime.evaluate` timeout, required `Page.reload`).
+- Progress dash: hide `progress` (`display:none`), otherwise visible as strikethrough in taller tabs (`absolute y369 h2`).
+- Observer pitfall: `new MutationObserver(apply).observe(strip,{childList:true,subtree:true})` where `apply` does `t.innerHTML=...` inside `strip` subtree → infinite loop → browser freeze (`Runtime.evaluate` timeout, required `Page.reload` + `Target.closeTarget`).
 
-Safe:
+Safe (current): `childList+subtree+characterData` with disconnect/re-observe + `setInterval 800` fallback + `setProperty(...,'important')`:
 
 ```js
-new MutationObserver(apply).observe(strip,{childList:true}); // not subtree
-newTabBtn.addEventListener('click',()=>setTimeout(apply,300));
+let debounce;
+const debounced = ()=>{clearTimeout(debounce); debounce=setTimeout(()=>{
+  observer.disconnect(); applyTabSplit();
+  observer.observe(strip,{childList:true,subtree:true,characterData:true});
+},300)};
+new MutationObserver(debounced).observe(strip,{childList:true,subtree:true,characterData:true});
+setInterval(applyTabSplit,800);
+newTabBtn.addEventListener('click',()=>setTimeout(applyTabSplit,300));
 ```
 
-`childList` on `strip` catches new `SPAN` wrappers; title writes inside don't re-trigger.
+## Domain Grouping with Gaps
+
+- Group key: `txt.split(' - ')[0]` → ` APPLE`/`🌲PP`/`🍊 NUC`/`blank`. `GAP=16` (`<38`).
+- `PositionY = idx*38 + gapsBefore*16` (`!important`), `tab-gap` fake blank `div` (`h16, top = idx*38+offset-16, border-bottom:1px white`) inserted at each `group[i]!==group[i-1]` (cleared each run). `tab-position` gets `tab-group-end` for `::after` alternative (now unused, kept for `overflow:visible`).
+- `resize.max-height = n*39 + totalGaps*16` (tight, `1px` border per tab). `1px` CSS → `0.606px` computed at UI zoom `1.6` (`1/1.65`), matches tab default; `1.6px` gives `1px` on screen.
+- Example `9` tabs `APPLE3,PP5,NUC1` → `2` gaps at `114`/`320` `h16` as `tab-gap` fake tabs.
 
 ## Tool
 

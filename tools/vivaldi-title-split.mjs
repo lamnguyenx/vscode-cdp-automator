@@ -11,10 +11,12 @@ async function targets() {
 }
 
 const NEW_H = 38;
-const HEIGHT_CSS = `.tab-strip .tab-position { --Height: ${NEW_H}px !important; }\n` + Array.from({ length: 50 }, (_, i) => `.tab-strip > span:nth-child(${i + 1}) .tab-position { --PositionY: ${i * NEW_H}px !important; }`).join('\n');
+const GAP = 40;
+const HEIGHT_CSS = `.tab-strip .tab-position { --Height: ${NEW_H}px !important; }`;
 const STYLE = `
-.tab-strip .tab-position .favicon, .tab-strip .tab-position .tab-audio, .tab-strip .tab-position .page-progress-indicator { display: none !important; } .tab-strip .tab-position .title { display: block !important; flex: 1 1 auto !important; height: auto !important; -webkit-mask-image: -webkit-linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; mask-image: linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; } .tab-header { height: auto !important; flex-basis: auto !important; overflow: visible !important; } .tab-position .tab { height: auto !important; flex-basis: auto !important; max-height: none !important; overflow: visible !important; justify-content: center !important; } 
+.tab-strip .tab-position .favicon, .tab-strip .tab-position .tab-audio, .tab-strip .tab-position .page-progress-indicator { display: none !important; } .tab-strip .tab-position .title { display: block !important; flex: 1 1 auto !important; height: auto !important; -webkit-mask-image: -webkit-linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; mask-image: linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; } .tab-header { height: auto !important; flex-basis: auto !important; overflow: visible !important; } .tab-position .tab { height: auto !important; flex-basis: auto !important; max-height: none !important; overflow: visible !important; justify-content: center !important; }
 .tab-strip .tab-position { border-bottom: 1px solid white; }
+.tab-gap { position: absolute; left: 0; right: 0; height: 8px; pointer-events: none; border-bottom: 1px solid white; }
 .tab-strip { border-right: none !important; }
 #tabs-tabbar-container { border-right: 1px solid white !important; }
 .tab-main-title { font-weight: bold; font-size: 80%; }
@@ -54,6 +56,8 @@ const apply = async (t) => {
       document.getElementById('tab-title-split')?.remove();
       document.getElementById('tab-order-numbers')?.remove();
       window._tabSplitObserver?.disconnect(); delete window._tabSplitObserver;
+      if (window._tabSplitInterval) { clearInterval(window._tabSplitInterval); delete window._tabSplitInterval; }
+      document.querySelectorAll('.tab-strip .tab-position').forEach(pos => { pos.style.removeProperty('--PositionY'); pos.classList.remove('tab-group-end'); });
       document.querySelectorAll('.tab-strip .tab-position .title').forEach(t => {
         const orig = t.getAttribute('data-orig-title');
         if (orig) t.textContent = orig;
@@ -73,38 +77,96 @@ const apply = async (t) => {
       style.textContent = ${JSON.stringify(STYLE)};
       document.head.appendChild(style);
       const NEW_H_INNER = ${NEW_H};
+      const GAP_INNER = ${GAP};
       const strip = document.querySelector('.tab-strip');
       const resize = strip?.parentElement;
+      const getGroup = (txt) => {
+        if (!txt || txt.trim() === 'Blank Page') return 'blank';
+        return txt.split(' - ')[0].trim();
+      };
       const applyTabSplit = () => {
-        document.querySelectorAll('.tab-strip .tab-position').forEach((pos, idx) => {
+        const positions = [...document.querySelectorAll('.tab-strip .tab-position')];
+        positions.forEach(p => p.classList.remove('tab-group-end'));
+        strip.querySelectorAll('.tab-gap').forEach(g => g.remove());
+        positions.forEach(p => p.classList.remove('tab-group-end'));
+        let offset = 0;
+        let prevGroup = null;
+        let totalGaps = 0;
+        const groups = positions.map(p => {
+          const t = p.querySelector('.title');
+          const raw = t ? (t.getAttribute('data-orig-title') || t.textContent) : '';
+          return getGroup(raw);
+        });
+        positions.forEach((pos, idx) => {
+          const group = groups[idx];
+          if (idx > 0 && group !== prevGroup) {
+            offset += GAP_INNER;
+            totalGaps++;
+            positions[idx-1].classList.add('tab-group-end');
+            const gap = document.createElement('div');
+            gap.className = 'tab-gap';
+            gap.style.top = (idx * NEW_H_INNER + offset - GAP_INNER) + 'px';
+            gap.style.height = GAP_INNER + 'px';
+            strip.appendChild(gap);
+          }
+          pos.style.setProperty('--PositionY', (idx * NEW_H_INNER + offset) + 'px', 'important');
+          prevGroup = group;
+        });
+        let visibleIdx = 0;
+        positions.forEach((pos) => {
           const t = pos.querySelector('.title');
           if (!t) return;
-          if (!t.getAttribute('data-orig-title')) {
-            const txt = t.textContent;
-            t.setAttribute('data-orig-title', txt);
-            const num = '<span class="tab-number">' + (idx + 1) + '.</span>';
+          const isNew = !t.getAttribute('data-orig-title');
+          const txt = isNew ? t.textContent : t.getAttribute('data-orig-title');
+          if (isNew) t.setAttribute('data-orig-title', txt);
+          if (txt.trim() === 'Blank Page') {
+            if (isNew) t.innerHTML = '';
+            return;
+          }
+          visibleIdx++;
+          const num = '<span class="tab-number">' + visibleIdx + '.</span>';
+          if (isNew) {
             if (txt.includes(' - ')) {
               const [first, ...rest] = txt.split(' - ');
               t.innerHTML = num + '<span class="tab-main-title">' + first + '</span><br><span class="tab-subtitle">' + rest.join(' - ') + '</span>';
             } else {
-              t.innerHTML = num + t.textContent;
+              t.innerHTML = num + txt;
             }
           } else {
             const n = t.querySelector('.tab-number');
-            if (n) n.textContent = (idx + 1) + '.';
+            if (n) n.textContent = visibleIdx + '.';
+            else {
+              if (txt.includes(' - ')) {
+                const [first, ...rest] = txt.split(' - ');
+                t.innerHTML = num + '<span class="tab-main-title">' + first + '</span><br><span class="tab-subtitle">' + rest.join(' - ') + '</span>';
+              } else {
+                t.innerHTML = num + txt;
+              }
+            }
           }
         });
         if (resize && resize.classList.contains('resize')) {
-          const n = document.querySelectorAll('.tab-strip .tab-position').length;
-          resize.style.setProperty('max-height', (n * (NEW_H_INNER + 1)) + 'px');
+          const n = positions.length;
+          resize.style.setProperty('max-height', (n * (NEW_H_INNER + 1) + totalGaps * GAP_INNER) + 'px');
         }
       };
       applyTabSplit();
-      if (!window._tabSplitObserver) {
-        window._tabSplitObserver = new MutationObserver(applyTabSplit);
-        window._tabSplitObserver.observe(strip, { childList: true });
+      if (window._tabSplitObserver) { window._tabSplitObserver.disconnect(); delete window._tabSplitObserver; }
+      if (window._tabSplitInterval) { clearInterval(window._tabSplitInterval); delete window._tabSplitInterval; }
+      {
+        let debounce;
+        const debouncedApply = () => {
+          clearTimeout(debounce);
+          debounce = setTimeout(() => {
+            window._tabSplitObserver.disconnect();
+            applyTabSplit();
+            window._tabSplitObserver.observe(strip, {childList:true, subtree:true, characterData:true});
+          }, 300);
+        };
+        window._tabSplitObserver = new MutationObserver(debouncedApply);
+        window._tabSplitObserver.observe(strip, {childList:true, subtree:true, characterData:true});
+        window._tabSplitInterval = setInterval(applyTabSplit, 800);
       }
-      // also catch the New Tab button (toolbar) — it creates a tab, which triggers the strip observer, but also observe toolbar clicks as fallback
       const newTabBtn = document.querySelector('.toolbar.toolbar-tabbar-after .button-toolbar.newtab button');
       if (newTabBtn && !newTabBtn._tabSplitWired) {
         newTabBtn._tabSplitWired = true;
