@@ -21,11 +21,16 @@
 // disappears or --refresh-node is passed. Worker mode is internal: the launcher invokes
 //   VWT_HOST=<host> <node> <tmp.mjs> --worker [<orig args>]
 // on the remote; the worker runs the same local discovery/attach/badge code.
+//
+// Per-machine concurrency: local + every --ssh host each run as their own parallel task (async
+// ssh round-trips, so a slow/unreachable host never holds up the others). Each machine prints
+// `showing in <name>...` before attempting the badge and `✓ done <name>` / `✗ done <name>`
+// afterwards (the remote worker prints its own pair, streamed back via ssh stdout).
 
 import { readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execSync, execFileSync, spawn } from 'node:child_process';
+import { execSync, execFile, spawn } from 'node:child_process';
 
 const argv = process.argv.slice(2);
 
@@ -156,9 +161,15 @@ const CACHE_FILE = path.join(CACHE_DIR, 'node-paths.json');
 
 const isGoodNode = v => { const m = /^v?(\d+)/.exec((v ?? '').trim()); return !!(m && +m[1] >= 18); };
 
+// async ssh wrapper so per-host pipelines can actually run in parallel (execFileSync would
+// block the event loop and serialize every host)
+const runSsh = (args, opts = {}) => new Promise((res, rej) => {
+  execFile('ssh', args, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...opts },
+    (err, stdout) => err ? rej(err) : res(stdout));
+});
+
 function sshExec(host, cmd, timeout = 15000) {
-  return execFileSync('ssh', ['-o', 'ConnectTimeout=8', host, cmd],
-    { encoding: 'utf8', timeout, stdio: ['pipe', 'pipe', 'pipe'] });
+  return runSsh(['-o', 'ConnectTimeout=8', host, cmd], { timeout });
 }
 
 function loadNodeCache() {
@@ -172,9 +183,9 @@ function saveNodeCache(c) {
 }
 
 // resolve ssh alias -> cache key (user@hostname:port via `ssh -G`)
-function resolveSSHHost(alias) {
+async function resolveSSHHost(alias) {
   try {
-    const g = execFileSync('ssh', ['-G', alias], { encoding: 'utf8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
+    const g = await runSsh(['-G', alias], { timeout: 10000 });
     const get = re => { const m = g.match(re); return m ? m[1] : null; };
     const user = get(/^user (.+)$/m) || process.env.USER || '';
     const host = get(/^hostname (.+)$/m) || alias;
@@ -186,12 +197,12 @@ function resolveSSHHost(alias) {
 }
 
 // resolve (or rediscover) a usable node binary for `host`. Returns path or null.
-function resolveRemoteNode(host, key, refresh = false) {
+async function resolveRemoteNode(host, key, refresh = false) {
   const cache = loadNodeCache();
   const entry = cache[key];
   if (!refresh && entry && entry.node) {
     try {
-      const v = sshExec(host, `test -x "${entry.node}" && "${entry.node}" --version`, 10000).trim();
+      const v = (await sshExec(host, `test -x "${entry.node}" && "${entry.node}" --version`, 10000)).trim();
       if (isGoodNode(v)) return entry.node;
     } catch {}
     console.error(`[${host}] cache miss: node at "${entry.node}" gone/unusable — refetching`);
@@ -201,30 +212,40 @@ function resolveRemoteNode(host, key, refresh = false) {
   let node = null;
   try {
     // .bashrc early-returns on non-TTY; `bash -ic` forces interactive rc sourcing (conda/brew).
-    const out = sshExec(host, 'bash -ic "command -v node" 2>/dev/null', 15000)
+    const out = (await sshExec(host, 'bash -ic "command -v node" 2>/dev/null', 15000))
       .split('\n').map(s => s.trim()).filter(Boolean);
     const cand = out[out.length - 1];
-    if (cand) { const v = sshExec(host, `"${cand}" --version`, 10000).trim(); if (isGoodNode(v)) node = cand; }
+    if (cand) { const v = (await sshExec(host, `"${cand}" --version`, 10000)).trim(); if (isGoodNode(v)) node = cand; }
   } catch {}
   if (!node) {
     for (const p of NODE_FALLBACKS) {
-      try { const v = sshExec(host, `test -x "${p}" && "${p}" --version`, 10000).trim(); if (isGoodNode(v)) { node = p; break; } } catch {}
+      try { const v = (await sshExec(host, `test -x "${p}" && "${p}" --version`, 10000)).trim(); if (isGoodNode(v)) { node = p; break; } } catch {}
     }
   }
   if (!node) { console.error(`[${host}] no node >= v18 found — skipping host`); return null; }
-  const version = sshExec(host, `"${node}" --version`, 10000).trim();
+  const version = (await sshExec(host, `"${node}" --version`, 10000)).trim();
   cache[key] = { node, version, ts: Math.floor(Date.now() / 1000) };
   saveNodeCache(cache);
   console.error(`[${host}] cached node ${version} at ${node}`);
   return node;
 }
 
+// stream `content` to a remote path over a fresh ssh (self-copy)
+const sshWrite = (host, remotePath, content) => new Promise((res, rej) => {
+  const child = spawn('ssh', ['-o', 'ConnectTimeout=8', host, `cat > ${remotePath}`]);
+  let err = '';
+  child.stderr.on('data', d => err += d);
+  child.on('error', rej);
+  child.on('close', code => code === 0 ? res() : rej(new Error(err.trim() || `ssh write failed (exit ${code})`)));
+  child.stdin.write(content);
+  child.stdin.end();
+});
+
 // copy self to a unique tmp dir on the remote; returns the remote worker path
-function selfCopyToRemote(host) {
+async function selfCopyToRemote(host) {
   const self = readFileSync(new URL(import.meta.url), 'utf8');
-  const workerPath = sshExec(host, `d=$(mktemp -d) && printf '%s' "$d/worker.mjs"`, 15000).trim();
-  execFileSync('ssh', ['-o', 'ConnectTimeout=8', host, `cat > ${workerPath}`],
-    { input: self, encoding: 'utf8', timeout: 15000 });
+  const workerPath = (await sshExec(host, `d=$(mktemp -d) && printf '%s' "$d/worker.mjs"`, 15000)).trim();
+  await sshWrite(host, workerPath, self);
   return workerPath;
 }
 
@@ -491,25 +512,8 @@ const applyAll = async (insts) => {
   }));
 };
 
-// apply to local instances (in worker mode these are the remote's own instances)
-await applyAll(instances);
-
-// launcher only: dispatch remote workers (self-copy + run on the remote). Worker mode skips this.
 const remoteWorkers = [];
 const remoteTmpDirs = [];
-if (!workerMode && sshHosts.length) {
-  for (const host of sshHosts) {
-    const key = resolveSSHHost(host);
-    const node = resolveRemoteNode(host, key, refreshNode);
-    if (!node) continue;
-    let tmp;
-    try { tmp = selfCopyToRemote(host); } catch (e) { console.error(`[${host}] self-copy failed: ${e.message}`); continue; }
-    remoteTmpDirs.push({ host, tmp });
-    const workerArgs = [...positional];
-    if (time) workerArgs.push('--time', String(time));
-    remoteWorkers.push({ child: dispatchRemoteWorker(host, node, tmp, workerArgs), host, tmp });
-  }
-}
 
 // cleanup — idempotent; runs on SIGINT/SIGTERM/SIGHUP or the --time timer
 const cleanup = async () => {
@@ -525,7 +529,17 @@ const cleanup = async () => {
     try { ws.close(); } catch {}
   }));
   for (const { child } of remoteWorkers) { try { child.kill('SIGTERM'); } catch {} }
-  for (const { host, tmp } of remoteTmpDirs) { try { sshExec(host, `rm -rf "${tmp.replace(/\/worker\.mjs$/, '')}"`, 8000); } catch {} }
+  for (const { host, tmp } of remoteTmpDirs) {
+    // ssh -T does NOT forward signals: killing the ssh child just closes the channel and the
+    // remote worker keeps running (its shell gets no signal without a pty). Signal it directly
+    // so its own SIGTERM handler removes the badge + closes its WS + exits. The `worker[.]mjs`
+    // class breaks the literal pattern so this pkill's own wrapper shell can't match itself;
+    // the worker's wrapper shell (which contains the plain path) dying too is harmless.
+    try {
+      const dir = tmp.replace(/\/worker\.mjs$/, '');
+      await sshExec(host, `pkill -TERM -f "${dir}/worker[.]mjs" 2>/dev/null; rm -rf "${dir}"`, 8000);
+    } catch {}
+  }
   process.exit(0);
 };
 
@@ -533,6 +547,36 @@ const cleanup = async () => {
 process.on('SIGINT', cleanup);
 process.on('SIGTERM', cleanup);
 process.on('SIGHUP', cleanup);
+
+// per-machine pipeline: announce before attempting, report done after. local + every --ssh host
+// each run as their own parallel task (the async ssh round-trips interleave on the event loop),
+// so a slow/unreachable host never holds up the others.
+const showOnHost = async (name, fn) => {
+  console.log(`showing in ${name}...`);
+  try {
+    await fn();
+    console.log(`✓ done ${name}`);
+  } catch (e) {
+    console.error(`✗ done ${name} — ${e.message}`);
+  }
+};
+
+// launcher: local + each ssh host in parallel. Worker mode: just this host's own instances.
+const localName = workerMode && workerHostTag ? workerHostTag : 'local';
+const tasks = [
+  showOnHost(localName, () => applyAll(instances)),
+  ...(workerMode ? [] : sshHosts.map(host => showOnHost(host, async () => {
+    const key = await resolveSSHHost(host);
+    const node = await resolveRemoteNode(host, key, refreshNode);
+    if (!node) throw new Error('no usable node — skipped');
+    const tmp = await selfCopyToRemote(host);
+    remoteTmpDirs.push({ host, tmp });
+    const workerArgs = [...positional];
+    if (time) workerArgs.push('--time', String(time));
+    remoteWorkers.push({ child: dispatchRemoteWorker(host, node, tmp, workerArgs), host, tmp });
+  }))),
+];
+await Promise.all(tasks);
 
 if (time && time > 0) {
   console.log(`auto-exit in ${time}s`);
@@ -543,8 +587,13 @@ if (time && time > 0) {
 // non-persistent modes (on/off/status) fall through and exit.
 while (attached.length || remoteWorkers.length) {
   if (!attached.length) {
-    // remote workers are the only thing keeping us up — wait for their exit
-    await Promise.all(remoteWorkers.map(({ child }) => new Promise(res => child.on('exit', res))));
+    // remote workers are the only thing keeping us up — wait for their exit. A fast-exiting
+    // worker (e.g. `status`/`on` mode) can be gone before the 'exit' listener is attached, so
+    // resolve immediately when the child has already exited.
+    await Promise.all(remoteWorkers.map(({ child }) => new Promise(res => {
+      if (child.exitCode !== null || child.signalCode !== null) return res();
+      child.on('exit', res);
+    })));
     break;
   }
   await new Promise(r => setTimeout(r, 500));

@@ -175,6 +175,12 @@ remote with the remote's own node:
    `ssh -N` to manage. `VWT_BADGE_CFG` carries the local badge config to the worker so remote
    badges match.
 
+Local + every `--ssh` host are dispatched **in parallel** — each machine is its own async task
+(the ssh round-trips are async, not `execFileSync`, so one slow/unreachable host can't hold up
+the others). Every machine announces `showing in <name>...` before attempting the badge and
+reports `✓ done <name>` / `✗ done <name>` afterwards (the remote worker prints its own pair,
+streamed back over ssh stdout).
+
 ```mermaid
 sequenceDiagram
     %%{init: {'theme': 'dark'}}%%
@@ -221,8 +227,16 @@ each remote worker):
 
 1. `Runtime.evaluate` → remove the badge `<div>` from the live DOM
 2. `ws.close()` the WebSocket
-3. `SIGTERM` every spawned ssh child, then `rm -rf` the remote tmp dir (worker also self-cleans
-   via `rm -f` + `rmdir` after it exits)
+3. `SIGTERM` every spawned ssh child, then `SIGTERM` the remote worker itself via
+   `pkill -TERM -f <dir>/worker[.]mjs` over a fresh ssh (the `[.]` class prevents the pkill
+   wrapper shell from matching its own cmdline), then `rm -rf` the remote tmp dir (the worker
+   also self-cleans via `rm -f` + `rmdir` after it exits)
+
+> **Why the explicit `pkill`?** `ssh -T` does **not** forward signals. Killing the local ssh
+> child just closes the channel — sshd sends nothing to the remote shell (no pty = no hangup
+> signal), so the worker would keep running until its own `--time` timer. The extra `pkill` over
+> a fresh ssh makes the remote worker's own SIGTERM handler run immediately: badge removed, WS
+> closed, process exited.
 
 This guarantees no badge ghosts remain on screen, no `ssh -N` processes linger, and no worker
 scripts or tmp dirs leak on the remote. `show` defaults to a **3s auto-exit** (configurable via
@@ -304,7 +318,10 @@ disambiguates mixed-host fleets at a glance.
 - **Every CDP round-trip is timeout-guarded** (`/json/list` 2s, WS open 3s, `Runtime.evaluate`
   5s) — a wedged listener is skipped with a warning, never an infinite hang.
 - **Cleanup is idempotent and signal/timer-agnostic** — removes DOM, closes WS, SIGTERMs ssh
-  children, and `rm -rf`s the remote tmp dir.
+  children, `pkill`s remote workers (so their own SIGTERM handler removes the remote badge and
+  exits), and `rm -rf`s the remote tmp dir.
+- **Hosts run in parallel, one task each** — local + every `--ssh` host are separate async
+  tasks; each prints `showing in <name>...` up front and `✓/✗ done <name>` afterwards.
 
 ## Related
 
