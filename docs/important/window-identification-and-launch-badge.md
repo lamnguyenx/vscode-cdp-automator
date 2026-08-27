@@ -1,7 +1,7 @@
 # Vivaldi/Chromium Window Identification & Launch-Args Badge
 
 Companion to `changing-vivaldi-vertical-tab-bar-size.md`, `changing-vivaldi-zoom.md`,
-`vivaldi-general-quirks.md`. Tool: `tools/vivaldi-window-title.mjs`.
+`vivaldi-general-quirks.md`. Tool: `tools/show-cdp-ports.mjs`.
 
 Two related problems, one tool:
 1. **Pin the OS window title** so it stops following the active tab (each CDP instance gets a
@@ -97,9 +97,9 @@ it has no `window.html`, just a single Electron `page` target.
 │ --remote-debugging-port=9022 │
 │ --user-data-dir=…            │
 │ ─────────────────── (5s bar) │  ← only when not persistent
-│ Ctrl+C to exit               │  ← only when persistent
+│ closing in 3s…               │  ← persistent: live countdown (default 3s)
 └─────────────────────────────┘
-   bottom:24px  right:24px
+   bottom:30px  right:30px
 ```
 
 Two modes control the bottom strip:
@@ -107,12 +107,12 @@ Two modes control the bottom strip:
 | Mode | Strip | Behavior |
 |------|-------|----------|
 | `on` (pin) | 5s countdown bar | flashes, then fades |
-| `show` (attached) | "Ctrl+C to exit" or "closing in Ns…" | stays until SIGINT or `--time` fires |
+| `show` (attached) | "closing in Ns…" live countdown | stays until `--time` (default 3s) or SIGINT fires |
 
 ## Discovery — where do the instances come from?
 
 The tool auto-discovers every `--remote-debugging-port=N` process so you rarely pass ports
-explicitly. Discovery branches by OS:
+explicitly. Discovery branches by OS, and **runs where the browser runs**:
 
 ```mermaid
 flowchart TD
@@ -121,16 +121,16 @@ flowchart TD
     B -->|local| C{OS?}
     C -->|Linux| D["/proc/[0-9]*/cmdline<br/>tr '\\0' → ' '"]
     C -->|macOS| E["ps -eo command="]
-    B -->|--ssh host| F["ssh host uname -s"]
-    F -->|Linux| G["ssh host '… /proc/*/cmdline …'"]
-    F -->|Darwin| H["ssh host ps -eo command="]
+    B -->|--ssh host| F["spawn remote worker<br/>self-copy + VWT_HOST=<host>"]
+    F --> C
     D --> I["filter: has --remote-debugging-port=N<br/>and NOT --type="]
     E --> I
-    G --> I
-    H --> J["slice from first '--' flag<br/>(ps splits paths on spaces)"]
-    J --> I
     I --> K["{ host, port, args, os }"]
 ```
+
+No `ssh -G`/`uname` round-trips for discovery: the remote worker re-runs the **same** local
+discovery code (`/proc` or `ps`) natively on the remote box, so it sees `127.0.0.1:<port>`
+directly. Only the node binary lookup goes over SSH (see below).
 
 ### The `/proc` ≠ null-separated gotcha (Vivaldi only)
 
@@ -154,31 +154,46 @@ null-separated processes like the crashpad handler still parse correctly).
 extracting args, **slice from the first token starting with `--`** — the binary path (however
 fragmented) is dropped and only real flags remain.
 
-### SSH port forwarding
+### Remote execution (no port forwarding)
 
-Remote CDP ports aren't reachable directly. The tool probes `127.0.0.1:<port>` and either
-**reuses** an existing forward (common — many users keep `LocalForward` in `~/.ssh/config`) or
-**spawns a managed `ssh -N -L` tunnel**. Spawned tunnels are tracked and killed on cleanup so
-nothing leaks.
+Remote CDP ports are bound to `127.0.0.1` on the remote box and are unreachable from here, so
+the tool **does not forward them at all**. Instead it self-copies the script and runs it on the
+remote with the remote's own node:
+
+1. **Node lookup** — `ssh <host> 'bash -ic "command -v node"'` (`.bashrc` early-returns on
+   non-TTY, so interactive rc-sourcing is required to find conda/brew nodes), with a fallback
+   list of well-known paths. Node must be ≥ **v18** (global `fetch`/`WebSocket`/`AbortController`).
+2. **Cache** — the resolved binary is cached at
+   `~/.cache/show-cdp-ports/node-paths.json`, keyed by the **resolved** host
+   (`user@hostname:port` from `ssh -G`). Each run just probes `test -x` + `--version` on the
+   cached path (~1 cheap ssh); it only re-discovers when that path is gone, or with
+   `--refresh-node`.
+3. **Self-copy** — `mktemp -d` on the remote, pipe this script into `<dir>/worker.mjs`.
+4. **Execute** — `VWT_HOST=<host> VWT_BADGE_CFG=<base64> <node> <worker.mjs> --worker <orig args>`
+   over `ssh -T`, stdio inherited so tagged logs stream back. The worker re-runs the whole local
+   pipeline against the remote's `127.0.0.1:<port>` — no tunnels, no port collisions, no
+   `ssh -N` to manage. `VWT_BADGE_CFG` carries the local badge config to the worker so remote
+   badges match.
 
 ```mermaid
 sequenceDiagram
     %%{init: {'theme': 'dark'}}%%
-    participant Tool
-    participant Probe as 127.0.0.1:port
-    participant SSH
-    participant Remote as remote:port
-    Tool->>Probe: TCP connect (probePort)
-    alt already listening
-        Probe-->>Tool: ok → reuse (pre-existing forward)
-    else not listening
-        Tool->>SSH: spawn ssh -N -L 127.0.0.1:port:127.0.0.1:port host
-        SSH->>Remote: tunnel established
-        loop poll up to 8s
-            Tool->>Probe: re-probe
-        end
+    participant L as Launcher (local node)
+    participant S as ssh
+    participant R as Remote worker (node)
+    L->>S: ssh -G host → resolved user@host:port
+    L->>R: probe cached node (test -x && --version)
+    alt cache hit & good
+        R-->>L: reuse path
+    else cache miss / --refresh-node
+        L->>R: bash -ic "command -v node" (+fallbacks)
+        R-->>L: path → write cache
     end
-    Note over Tool: CDP fetch + WebSocket now work as-if local
+    L->>R: mktemp -d; cat self > worker.mjs
+    L->>R: VWT_HOST=host VWT_BADGE_CFG=… node worker.mjs --worker <args>
+    R->>R: own /proc|ps discovery → 127.0.0.1:port
+    R->>R: CDP attach → inject badge
+    R-->>L: tagged logs via ssh stdout
 ```
 
 ## Lifecycle — attach and cleanup
@@ -187,9 +202,9 @@ sequenceDiagram
 stateDiagram-v2
     %%{init: {'theme': 'dark'}}%%
     [*] --> Discovering
-    Discovering --> Forwarding: if remote
     Discovering --> Attaching: if local
-    Forwarding --> Attaching
+    Discovering --> Spawning: if remote (--ssh)
+    Spawning --> Attaching: worker runs on remote
     Attaching --> Badging: inject overlay
     Badging --> Attached: show mode keeps WS open
     Badging --> Exiting: on/off/status close WS
@@ -200,33 +215,66 @@ stateDiagram-v2
 
 ### Cleanup contract
 
-The cleanup handler runs on SIGINT, SIGTERM, **and** the `--time` timer. It is **idempotent**
-(flag-guarded) so `Ctrl+C` racing the timer doesn't double-fire. For each attached target:
+The cleanup handler runs on SIGINT, SIGTERM, SIGHUP, **and** the `--time` timer. It is
+**idempotent** (flag-guarded) so `Ctrl+C` racing the timer doesn't double-fire. Locally (and in
+each remote worker):
 
 1. `Runtime.evaluate` → remove the badge `<div>` from the live DOM
 2. `ws.close()` the WebSocket
-3. `SIGTERM` every spawned ssh tunnel child
+3. `SIGTERM` every spawned ssh child, then `rm -rf` the remote tmp dir (worker also self-cleans
+   via `rm -f` + `rmdir` after it exits)
 
-This guarantees no badge ghosts remain on screen and no `ssh -N` processes linger after exit.
+This guarantees no badge ghosts remain on screen, no `ssh -N` processes linger, and no worker
+scripts or tmp dirs leak on the remote. `show` defaults to a **3s auto-exit** (configurable via
+`time` in `~/.config/cdp-show-badge/config.json`) so a killed parent can never orphan a worker:
+the worker carries its own `--time`, and even if the ssh pipe dies (parent SIGKILLed), the
+page-side **heartbeat watchdog** (refreshed every 2s by the worker, self-removes the badge within
+~6s of it stopping) cleans up the screen. The launcher stays alive only while local `attached`
+WS connections or remote workers are live; non-persistent modes (`on`/`off`/`status`) exit as
+soon as their work is done.
+
+## Badge config — `~/.config/cdp-show-badge/config.json`
+
+Badge appearance, position, and the `show` auto-exit default are configurable via a JSON file
+(local only; remote workers receive it from the launcher via the `VWT_BADGE_CFG` env var). All
+keys optional:
+
+```json
+{
+  "time": 3,
+  "opacity": 0.8,
+  "width": 300,
+  "position": { "bottom": 30, "right": 30 }
+}
+```
+
+| Key | Effect |
+|-----|--------|
+| `time` | `show` auto-exit seconds when `--time` isn't given (default 3) |
+| `opacity` | badge opacity 0..1 (default 0.8) |
+| `width` | badge `max-width` px (default 300) |
+| `position` | `top`/`bottom`/`left`/`right` px offsets; giving `top` or `left` drops the matching `bottom`/`right` default |
 
 ## CLI surface
 
 | Arg | Effect |
 |-----|--------|
-| `show` | attach + persist badge (stays until Ctrl+C / `--time`) |
+| `show` | attach + persist badge (stays until Ctrl+C / `--time`; **default 3s auto-exit**) |
 | `on` (default) | pin title + flash 5s badge |
 | `"<text>"` | pin a custom title instead of `Vivaldi :<port>` |
 | `off` | drop the lock, restore active-tab behaviour |
 | `status` | report lock state as JSON |
 | `<ports...>` | explicit local ports (else auto-discover) |
-| `--ssh h1,h2,…` | also discover + badge remote hosts (additive to local) |
-| `--time N` | auto-exit after N seconds (badge shows countdown) |
+| `--ssh h1,h2,…` | also badge remote hosts (additive to local; runs on-remote if node ≥ v18) |
+| `--time N` | auto-exit after N seconds (badge shows countdown; `show` defaults to 3) |
+| `--refresh-node` | discard cached remote node path, force re-discovery |
 
 ```bash
-node tools/vivaldi-window-title.mjs show                       # all local instances, attached
-node tools/vivaldi-window-title.mjs show --ssh mac             # local + mac, attached
-node tools/vivaldi-window-title.mjs show --ssh mac,nuc --time 10
-node tools/vivaldi-window-title.mjs on 9022                    # pin + 5s flash
+node tools/show-cdp-ports.mjs show                       # all local instances, attached
+node tools/show-cdp-ports.mjs show --ssh mac             # local + mac, attached
+node tools/show-cdp-ports.mjs show --ssh pp,mac --time 10
+node tools/show-cdp-ports.mjs on 9022                    # pin + 5s flash
+node tools/show-cdp-ports.mjs status --ssh pp --refresh-node
 ```
 
 ## Cross-host instance matrix (this setup)
@@ -239,8 +287,8 @@ node tools/vivaldi-window-title.mjs on 9022                    # pin + 5s flash
 | 9221 | mac | macos | Vivaldi Snapshot (beta) |
 | 9222 | mac | macos | Vivaldi (stable) |
 
-Ports 9221/9222 were already `LocalForward`'d in the user's ssh config, so the tool reuses
-those tunnels (no spawn needed). The badge's orange `@host` tag + green `LINUX`/`MACOS` pill
+Remote instances need **no LocalForward** anymore — the tool runs a worker on the remote box
+against its own `127.0.0.1:<port>`. The badge's orange `@host` tag + green `LINUX`/`MACOS` pill
 disambiguates mixed-host fleets at a glance.
 
 ## Key takeaways
@@ -249,11 +297,14 @@ disambiguates mixed-host fleets at a glance.
   permanent lock. Don't touch the `<title>` element's own setters.
 - **The badge is just a fixed-position `<div>`** — any CDP renderer with a `document.body`
   works, including non-Vivaldi Electron apps.
-- **Discovery is OS-aware**: `/proc` (null→space normalized) on Linux, `ps` on macOS, gated by
-  remote `uname -s` over SSH.
-- **Forwarding is opportunistic**: reuse if listening, else own a child `ssh -N -L` and kill it
-  on cleanup.
-- **Cleanup is idempotent and signal/timer-agnostic** — removes DOM, closes WS, kills tunnels.
+- **Discovery is OS-aware and runs where the browser runs**: `/proc` (null→space normalized) on
+  Linux, `ps` on macOS — locally, or in a spawned remote worker via `--ssh`.
+- **Remote hosts execute the script in place** — no `ssh -L` forwarding, no port choosing, no
+  `LocalForward` reuse. Just a node binary (≥ v18, cached per host) + self-copy + `--worker`.
+- **Every CDP round-trip is timeout-guarded** (`/json/list` 2s, WS open 3s, `Runtime.evaluate`
+  5s) — a wedged listener is skipped with a warning, never an infinite hang.
+- **Cleanup is idempotent and signal/timer-agnostic** — removes DOM, closes WS, SIGTERMs ssh
+  children, and `rm -rf`s the remote tmp dir.
 
 ## Related
 
