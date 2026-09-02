@@ -3,7 +3,7 @@
 // Usage:  node vivaldi-title-split.mjs [on|off|status]   (default: on)
 
 const arg = process.argv[2] ?? 'on';
-const PORT = 9222;
+const PORT = Number(process.env.CDP_PORT) || 9222;
 
 async function targets() {
   const list = await fetch(`http://127.0.0.1:${PORT}/json/list`).then(r => r.json());
@@ -13,15 +13,24 @@ async function targets() {
 const NEW_H = 38;
 const GAP = 40;
 const HEIGHT_CSS = `.tab-strip .tab-position { --Height: ${NEW_H}px !important; }`;
+// IMPORTANT: never mutate `.title` children — Vivaldi's framework owns that text
+// node, and overwriting .innerHTML makes a later framework re-render (e.g. the
+// rename triggered by double-click) call removeChild on the dead node → crash
+// (NotFoundError: removeChild). All numbering/splitting is rendered through
+// ::before / ::after pseudo-elements fed by CSS custom props we set on
+// `.tab-position.style` (--tnum/--tmain/--tsub/--ttxt). Custom props survive a
+// framework re-render (same trick already used for --PositionY), so the
+// framework's tracked children stay intact.
 const STYLE = `
-.tab-strip .tab-position .favicon, .tab-strip .tab-position .tab-audio, .tab-strip .tab-position .page-progress-indicator { display: none !important; } .tab-strip .tab-position .title { display: block !important; flex: 1 1 auto !important; height: auto !important; -webkit-mask-image: -webkit-linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; mask-image: linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; } .tab-header { height: auto !important; flex-basis: auto !important; overflow: visible !important; } .tab-position .tab { height: auto !important; flex-basis: auto !important; max-height: none !important; overflow: visible !important; justify-content: center !important; }
-.tab-strip .tab-position { border-bottom: 1px solid white; }
-.tab-gap { position: absolute; left: 0; right: 0; height: 8px; pointer-events: none; border-bottom: 1px solid white; }
+.tab-strip .tab-position .favicon, .tab-strip .tab-position .tab-audio, .tab-strip .tab-position .page-progress-indicator { display: none !important; }
+.tab-strip .tab-position .title { display: block !important; flex: 1 1 auto !important; height: auto !important; color: transparent !important; font-size: 0 !important; line-height: 1 !important; padding: 0 8px !important; position: relative; -webkit-mask-image: -webkit-linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; mask-image: linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; }
+.tab-strip .tab-position .title::before { content: var(--tnum, "") var(--tmain, ""); display: block; color: var(--ttxt, #e6e6e6); font-weight: 700; font-size: 11px; line-height: 1; }
+.tab-strip .tab-position .title::after { content: var(--tsub, ""); display: block; color: var(--ttxt, #e6e6e6); font-weight: 400; font-size: 12px; line-height: 1; }
+.tab-header { height: auto !important; flex-basis: auto !important; overflow: visible !important; } .tab-position .tab { height: auto !important; flex-basis: auto !important; max-height: none !important; overflow: visible !important; justify-content: center !important; padding: 2px 0 !important; }
+.tab-strip .tab-position { border-bottom: 1px solid rgba(255,255,255,0.12); }
+.tab-strip .tab-position.tab-group-end { border-bottom: 1px solid rgba(255,255,255,0.45); }
 .tab-strip { border-right: none !important; }
-#tabs-tabbar-container { border-right: 1px solid white !important; }
-.tab-main-title { font-weight: bold; font-size: 80%; }
-.tab-subtitle { font-size: inherit; }
-.tab-number { font-weight: 700; color: #8b8b8b; font-size: 80%; margin-right: 0; }
+#tabs-tabbar-container { border-right: 1px solid rgba(255,255,255,0.18) !important; }
 ${HEIGHT_CSS}
 `.trim();
 
@@ -57,10 +66,18 @@ const apply = async (t) => {
       document.getElementById('tab-order-numbers')?.remove();
       window._tabSplitObserver?.disconnect(); delete window._tabSplitObserver;
       if (window._tabSplitInterval) { clearInterval(window._tabSplitInterval); delete window._tabSplitInterval; }
-      document.querySelectorAll('.tab-strip .tab-position').forEach(pos => { pos.style.removeProperty('--PositionY'); pos.classList.remove('tab-group-end'); });
+      document.querySelectorAll('.tab-strip .tab-position').forEach(pos => {
+        pos.style.removeProperty('--PositionY');
+        pos.style.removeProperty('--tnum');
+        pos.style.removeProperty('--tmain');
+        pos.style.removeProperty('--tsub');
+        pos.style.removeProperty('--ttxt');
+        pos.classList.remove('tab-group-end');
+      });
       document.querySelectorAll('.tab-strip .tab-position .title').forEach(t => {
-        const orig = t.getAttribute('data-orig-title');
-        if (orig) t.textContent = orig;
+        // During on we never mutate the .title children — only set font-size:0
+        // on the element so the live text hides behind pseudo-elements. So there
+        // is nothing to restore here; just drop the stale cache attribute.
         t.removeAttribute('data-orig-title');
       });
       const resize = document.querySelector('.tab-strip')?.parentElement;
@@ -87,15 +104,12 @@ const apply = async (t) => {
       const applyTabSplit = () => {
         const positions = [...document.querySelectorAll('.tab-strip .tab-position')];
         positions.forEach(p => p.classList.remove('tab-group-end'));
-        strip.querySelectorAll('.tab-gap').forEach(g => g.remove());
-        positions.forEach(p => p.classList.remove('tab-group-end'));
         let offset = 0;
         let prevGroup = null;
         let totalGaps = 0;
         const groups = positions.map(p => {
           const t = p.querySelector('.title');
-          const raw = t ? (t.getAttribute('data-orig-title') || t.textContent) : '';
-          return getGroup(raw);
+          return getGroup(t ? t.textContent : '');
         });
         positions.forEach((pos, idx) => {
           const group = groups[idx];
@@ -103,11 +117,6 @@ const apply = async (t) => {
             offset += GAP_INNER;
             totalGaps++;
             positions[idx-1].classList.add('tab-group-end');
-            const gap = document.createElement('div');
-            gap.className = 'tab-gap';
-            gap.style.top = (idx * NEW_H_INNER + offset - GAP_INNER) + 'px';
-            gap.style.height = GAP_INNER + 'px';
-            strip.appendChild(gap);
           }
           pos.style.setProperty('--PositionY', (idx * NEW_H_INNER + offset) + 'px', 'important');
           prevGroup = group;
@@ -116,33 +125,31 @@ const apply = async (t) => {
         positions.forEach((pos) => {
           const t = pos.querySelector('.title');
           if (!t) return;
-          const isNew = !t.getAttribute('data-orig-title');
-          const txt = isNew ? t.textContent : t.getAttribute('data-orig-title');
-          if (isNew) t.setAttribute('data-orig-title', txt);
-          if (txt.trim() === 'Blank Page') {
-            if (isNew) t.innerHTML = '';
+          // Read the live textContent every run — never mutate .title's
+          // children (the framework owns them; touching them triggers a
+          // removeChild crash on re-render). font-size:0 on .title keeps the
+          // text node intact and framework-updated but visually hidden, so our
+          // pseudo-elements are the only visible rendering. No cache means
+          // tab-title updates (navigation) are picked up on the next rerun.
+          const txt = t.textContent;
+          // Theme color captured from the .tab (parent of .title) because by now
+          // our own CSS has set color:transparent on .title itself.
+          pos.style.setProperty('--ttxt', getComputedStyle(t.closest('.tab') ?? t).color);
+          if (!txt || txt.trim() === '' || txt.trim() === 'Blank Page') {
+            pos.style.setProperty('--tnum', '""');
+            pos.style.setProperty('--tmain', '""');
+            pos.style.setProperty('--tsub', '""');
             return;
           }
           visibleIdx++;
-          const num = '<span class="tab-number">' + visibleIdx + '.</span>';
-          if (isNew) {
-            if (txt.includes(' - ')) {
-              const [first, ...rest] = txt.split(' - ');
-              t.innerHTML = num + '<span class="tab-main-title">' + first + '</span><br><span class="tab-subtitle">' + rest.join(' - ') + '</span>';
-            } else {
-              t.innerHTML = num + txt;
-            }
+          pos.style.setProperty('--tnum', JSON.stringify(visibleIdx + '.'));
+          if (txt.includes(' - ')) {
+            const [first, ...rest] = txt.split(' - ');
+            pos.style.setProperty('--tmain', JSON.stringify(first));
+            pos.style.setProperty('--tsub', JSON.stringify(rest.join(' - ')));
           } else {
-            const n = t.querySelector('.tab-number');
-            if (n) n.textContent = visibleIdx + '.';
-            else {
-              if (txt.includes(' - ')) {
-                const [first, ...rest] = txt.split(' - ');
-                t.innerHTML = num + '<span class="tab-main-title">' + first + '</span><br><span class="tab-subtitle">' + rest.join(' - ') + '</span>';
-              } else {
-                t.innerHTML = num + txt;
-              }
-            }
+            pos.style.setProperty('--tmain', JSON.stringify(txt));
+            pos.style.setProperty('--tsub', '""');
           }
         });
         if (resize && resize.classList.contains('resize')) {
