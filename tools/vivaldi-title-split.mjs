@@ -23,9 +23,9 @@ const HEIGHT_CSS = `.tab-strip .tab-position { --Height: ${NEW_H}px !important; 
 // framework's tracked children stay intact.
 const STYLE = `
 .tab-strip .tab-position .favicon, .tab-strip .tab-position .tab-audio, .tab-strip .tab-position .page-progress-indicator { display: none !important; }
-.tab-strip .tab-position .title { display: block !important; flex: 1 1 auto !important; height: auto !important; color: transparent !important; font-size: 0 !important; line-height: 1 !important; padding: 0 8px !important; position: relative; -webkit-mask-image: -webkit-linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; mask-image: linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; }
-.tab-strip .tab-position .title::before { content: var(--tnum, "") var(--tmain, ""); display: block; color: var(--ttxt, #e6e6e6); font-weight: 700; font-size: 11px; line-height: 1; }
-.tab-strip .tab-position .title::after { content: var(--tsub, ""); display: block; color: var(--ttxt, #e6e6e6); font-weight: 400; font-size: 12px; line-height: 1; }
+.tab-strip .tab-position .title { display: block !important; flex: 1 1 auto !important; height: auto !important; font-size: 0 !important; line-height: 1 !important; padding: 0 8px !important; position: relative; -webkit-mask-image: -webkit-linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; mask-image: linear-gradient(90deg, rgb(255,255,255) calc(100% - 30px), rgba(0,0,0,0) 100%) !important; }
+.tab-strip .tab-position .title::before { content: var(--tnum, "") var(--tmain, ""); display: block; color: inherit; font-weight: 700; font-size: 11px; line-height: 1; }
+.tab-strip .tab-position .title::after { content: var(--tsub, ""); display: block; color: inherit; font-weight: 400; font-size: 12px; line-height: 1; }
 .tab-header { height: auto !important; flex-basis: auto !important; overflow: visible !important; } .tab-position .tab { height: auto !important; flex-basis: auto !important; max-height: none !important; overflow: visible !important; justify-content: center !important; padding: 2px 0 !important; }
 .tab-strip .tab-position { border-bottom: 1px solid rgba(255,255,255,0.12); }
 .tab-strip .tab-position.tab-group-end { border-bottom: 1px solid rgba(255,255,255,0.45); }
@@ -71,7 +71,6 @@ const apply = async (t) => {
         pos.style.removeProperty('--tnum');
         pos.style.removeProperty('--tmain');
         pos.style.removeProperty('--tsub');
-        pos.style.removeProperty('--ttxt');
         pos.classList.remove('tab-group-end');
       });
       document.querySelectorAll('.tab-strip .tab-position .title').forEach(t => {
@@ -132,9 +131,6 @@ const apply = async (t) => {
           // pseudo-elements are the only visible rendering. No cache means
           // tab-title updates (navigation) are picked up on the next rerun.
           const txt = t.textContent;
-          // Theme color captured from the .tab (parent of .title) because by now
-          // our own CSS has set color:transparent on .title itself.
-          pos.style.setProperty('--ttxt', getComputedStyle(t.closest('.tab') ?? t).color);
           if (!txt || txt.trim() === '' || txt.trim() === 'Blank Page') {
             pos.style.setProperty('--tnum', '""');
             pos.style.setProperty('--tmain', '""');
