@@ -25,6 +25,8 @@ vscode-ui-resizer.exe save-vivaldi [port]             Save Vivaldi window + vert
 vscode-ui-resizer.exe restore-vivaldi [port]          Restore Vivaldi window + tab bar
 vscode-ui-resizer.exe save-vivaldi-zoom [port]        Save Vivaldi UI + default page zoom
 vscode-ui-resizer.exe restore-vivaldi-zoom [port]     Restore zoom and apply to every tab
+vscode-ui-resizer.exe save-windows                    Save pos & size of all other open GUI app windows
+vscode-ui-resizer.exe restore-windows                 Apply saved geometry to windows of already-running apps
 vscode-ui-resizer.exe vivaldi-tab-numbers [port]      Inject tab-order numbers into tab strip
 vscode-ui-resizer.exe save-all [port]                 Run all save steps in sequence
 vscode-ui-resizer.exe restore-all [port]              Run all restore steps in sequence
@@ -33,7 +35,7 @@ vscode-ui-resizer.exe list-displays                   Print connected screens
 
 ## Config
 
-Single store at `~/.config/vscode-cdp-automator/config.json`, keyed by a display fingerprint (frame, pixel size, rotation, name of every screen). Each entry keeps `window`, `layout`, `codeServerLayout`, and `vivaldi`. Legacy configs under `~/.config/vscode/` are auto-migrated on first load.
+Single store at `~/.config/vscode-cdp-automator/config.json`, keyed by a display fingerprint (frame, pixel size, rotation, name of every screen). Each entry keeps `window`, `layout`, `codeServerLayout`, `vivaldi`, and `otherWindows` (a `bundleID -> [window]` map for every other GUI app, restored positionally by index). Legacy configs under `~/.config/vscode/` are auto-migrated on first load.
 
 ## How it works
 
@@ -41,6 +43,7 @@ Single store at `~/.config/vscode-cdp-automator/config.json`, keyed by a display
 - **VS Code sidebar/panel widths** — CDP `Runtime.evaluate` discovery of Monaco sash indices, then synthetic `MouseEvent` `mousedown → mousemove → mouseup` on `window` (VS Code sashes listen for plain MouseEvents).
 - **Vivaldi tab bar** — CDP `Input.dispatchMouseEvent` (trusted input), because Vivaldi's resize handle calls `setPointerCapture` and rejects synthetic events.
 - **Zoom** — VS Code: regex-edit of `settings.json` `window.zoomLevel`; Vivaldi: `window.vivaldi.zoom` + `chrome.tabs.setZoom` over `window.html` target.
+- **Other windows** — every running `.regular` GUI app (excluding VS Code + Vivaldi) has its windows enumerated via `AXWindows`, keyed by `bundleIdentifier` and stored positionally. Restore only positions windows of apps already running; absent apps log a warning and are skipped (never launched).
 - **Eligibility gating** — windows are skipped unless sidebar-left / panel-right / not-maximized, so orthogonal layouts are never clobbered.
 
 ## Tools

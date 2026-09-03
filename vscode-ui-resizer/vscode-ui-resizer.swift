@@ -69,6 +69,7 @@ struct DisplayConfig: Codable {
     var layout: LayoutConfig?
     var codeServerLayout: LayoutConfig?
     var vivaldi: VivaldiConfig?
+    var otherWindows: [String: [WindowInfo]]?
 }
 
 func loadConfigStore() -> [String: DisplayConfig] {
@@ -225,6 +226,56 @@ func axGetPID(_ el: AXUIElement) -> pid_t {
     var pid: pid_t = 0
     AXUIElementGetPid(el, &pid)
     return pid
+}
+
+// MARK: - Window Geometry Apply (shared retry loop)
+
+func applyWindowGeometry(
+    _ win: AXUIElement,
+    target: WindowInfo,
+    globalPos: CGPoint,
+    maxRetries: Int = 5,
+    firstSleep: TimeInterval = 0.15,
+    retrySleep: TimeInterval = 0.2,
+    verboseFullscreen: Bool = true
+) -> Bool {
+    if isFullScreen(win) {
+        print("    full-screen detected, exiting...")
+        exitFullScreen(win)
+        if verboseFullscreen {
+            if isFullScreen(win) {
+                print("    WARNING: could not exit full-screen, position/size may fail")
+            } else {
+                print("    exited full-screen")
+            }
+        }
+    }
+
+    var ok = false
+    for attempt in 1...maxRetries {
+        axSetPoint(win, "AXPosition", globalPos)
+        axSetSize(win, "AXSize", CGSize(width: target.width, height: target.height))
+
+        Thread.sleep(forTimeInterval: attempt == 1 ? firstSleep : retrySleep)
+
+        if let newPos = axGetPoint(win, "AXPosition"),
+           let newSize = axGetSize(win, "AXSize") {
+            let posOk = abs(newPos.x - globalPos.x) < 3 && abs(newPos.y - globalPos.y) < 3
+            let sizeOk = abs(newSize.width - CGFloat(target.width)) < 3 && abs(newSize.height - CGFloat(target.height)) < 3
+            let status = (posOk && sizeOk) ? "OK" : "RETRY"
+            print("    #\(attempt): pos=(\(Int(newPos.x)), \(Int(newPos.y)))  size=\(Int(newSize.width))x\(Int(newSize.height))  [\(status)]")
+            if posOk && sizeOk {
+                ok = true
+                break
+            }
+        } else {
+            print("    #\(attempt): could not read back")
+        }
+    }
+    if !ok {
+        print("    FAILED after \(maxRetries) attempts")
+    }
+    return ok
 }
 
 // MARK: - Screen Description
@@ -464,6 +515,30 @@ func findFrontmostVivaldiWindow() -> (window: AXUIElement, title: String, pid: p
     }
 
     return nil
+}
+
+// MARK: - Find Other (Generic) App Windows
+
+func findOtherApps() -> [(bundleID: String, pid: pid_t, appEl: AXUIElement, windows: [AXUIElement])] {
+    var results: [(String, pid_t, AXUIElement, [AXUIElement])] = []
+
+    let apps = NSWorkspace.shared.runningApplications.filter { app in
+        guard app.activationPolicy == .regular,
+              let bid = app.bundleIdentifier
+        else { return false }
+        if VSCODE_BUNDLES.contains(bid) { return false }
+        if bid == VIVALDI_BUNDLE_ID { return false }
+        return true
+    }
+
+    for app in apps {
+        let appEl = AXUIElementCreateApplication(app.processIdentifier)
+        applyAXTimeout(appEl)
+        guard let windows = axGetArray(appEl, "AXWindows"), !windows.isEmpty else { continue }
+        results.append((app.bundleIdentifier!, app.processIdentifier, appEl, windows))
+    }
+
+    return results
 }
 
 // MARK: - CDP Helpers
@@ -1009,45 +1084,7 @@ func cmdRestoreWin(port: Int) {
             }
         }
 
-        if isFullScreen(win) {
-            print("    full-screen detected, exiting...")
-            exitFullScreen(win)
-            if isFullScreen(win) {
-                print("    WARNING: could not exit full-screen, position/size may fail")
-            } else {
-                print("    exited full-screen")
-            }
-        }
-
-        let maxRetries = 5
-        var ok = false
-        for attempt in 1...maxRetries {
-            axSetPoint(win, "AXPosition", globalPos)
-            axSetSize(win, "AXSize", CGSize(width: target.width, height: target.height))
-
-            if attempt == 1 {
-                Thread.sleep(forTimeInterval: 0.15)
-            } else {
-    Thread.sleep(forTimeInterval: 0.2)
-            }
-
-            if let newPos = axGetPoint(win, "AXPosition"),
-               let newSize = axGetSize(win, "AXSize") {
-                let posOk = abs(newPos.x - globalPos.x) < 3 && abs(newPos.y - globalPos.y) < 3
-                let sizeOk = abs(newSize.width - CGFloat(target.width)) < 3 && abs(newSize.height - CGFloat(target.height)) < 3
-                let status = (posOk && sizeOk) ? "OK" : "RETRY"
-                print("    #\(attempt): pos=(\(Int(newPos.x)), \(Int(newPos.y)))  size=\(Int(newSize.width))x\(Int(newSize.height))  [\(status)]")
-                if posOk && sizeOk {
-                    ok = true
-                    break
-                }
-            } else {
-                print("    #\(attempt): could not read back")
-            }
-        }
-        if !ok {
-            print("    FAILED after \(maxRetries) attempts")
-        }
+        _ = applyWindowGeometry(win, target: target, globalPos: globalPos)
         print("")
     }
 }
@@ -1878,36 +1915,15 @@ func cmdRestoreVivaldi(port: Int) {
             let (win, _, _, _) = current[i]
             print("[\(i+1)]")
 
-            if isFullScreen(win) {
-                print("    full-screen detected, exiting...")
-                exitFullScreen(win)
-            }
-
-            let maxRetries = 3
-            var ok = false
-            for attempt in 1...maxRetries {
-                axSetPoint(win, "AXPosition", globalPos)
-                axSetSize(win, "AXSize", CGSize(width: target.width, height: target.height))
-
-                Thread.sleep(forTimeInterval: attempt == 1 ? 0.1 : 0.15)
-
-                if let newPos = axGetPoint(win, "AXPosition"),
-                   let newSize = axGetSize(win, "AXSize") {
-                    let posOk = abs(newPos.x - globalPos.x) < 3 && abs(newPos.y - globalPos.y) < 3
-                    let sizeOk = abs(newSize.width - CGFloat(target.width)) < 3 && abs(newSize.height - CGFloat(target.height)) < 3
-                    let status = (posOk && sizeOk) ? "OK" : "RETRY"
-                    print("    #\(attempt): pos=(\(Int(newPos.x)), \(Int(newPos.y)))  size=\(Int(newSize.width))x\(Int(newSize.height))  [\(status)]")
-                    if posOk && sizeOk {
-                        ok = true
-                        break
-                    }
-                } else {
-                    print("    #\(attempt): could not read back")
-                }
-            }
-            if !ok {
-                print("    FAILED after \(maxRetries) attempts")
-            }
+            _ = applyWindowGeometry(
+                win,
+                target: target,
+                globalPos: globalPos,
+                maxRetries: 3,
+                firstSleep: 0.1,
+                retrySleep: 0.15,
+                verboseFullscreen: false
+            )
             print("")
         }
     }
@@ -2038,6 +2054,155 @@ func cmdRestoreVivaldiZoom(port: Int) {
     }
 }
 
+// MARK: - Save Other Windows
+
+func cmdSaveWindows() {
+    let apps = findOtherApps()
+    guard !apps.isEmpty else {
+        fputs("Skipping save-windows: no other GUI app windows found.\n", stderr)
+        return
+    }
+
+    var byBundle: [String: [WindowInfo]] = [:]
+    var order: [String] = []
+
+    for (bundleID, _, _, windows) in apps {
+        var infos: [WindowInfo] = []
+        for win in windows {
+            if axGetBool(win, "AXMinimized") == true { continue }
+            guard let pos = axGetPoint(win, "AXPosition"),
+                  let size = axGetSize(win, "AXSize")
+            else { continue }
+
+            let title = axGetString(win, "AXTitle") ?? ""
+            let (screenFrame, relX, relY) = describeScreen(containing: pos)
+            let label = title.isEmpty ? bundleID : title
+
+            infos.append(WindowInfo(
+                title: title,
+                pid: 0,
+                x: Double(pos.x),
+                y: Double(pos.y),
+                width: Double(size.width),
+                height: Double(size.height),
+                screenFrame: screenFrame,
+                screenRelativeX: relX,
+                screenRelativeY: relY,
+                label: label
+            ))
+        }
+        if !infos.isEmpty {
+            if byBundle[bundleID] == nil { order.append(bundleID) }
+            byBundle[bundleID] = infos
+        }
+    }
+
+    guard !byBundle.isEmpty else {
+        fputs("Skipping save-windows: no positional windows found (all minimized or no geometry).\n", stderr)
+        return
+    }
+
+    let fingerPrint = displayFingerprint()
+    var store = loadConfigStore()
+    var entry = store[fingerPrint] ?? DisplayConfig(window: nil, layout: nil)
+    entry.otherWindows = byBundle
+    store[fingerPrint] = entry
+    guard saveConfigStore(store) else { exit(1) }
+
+    let totalWindows = byBundle.values.reduce(0) { $0 + $1.count }
+    print("Saved \(totalWindows) window(s) across \(byBundle.count) app(s) → \(CONFIG_PATH)\n")
+    for bid in order {
+        let count = byBundle[bid]?.count ?? 0
+        print("  \(bid.padding(toLength: 36, withPad: " ", startingAt: 0)) \(count) window(s)")
+    }
+    print("\nDisplay layout:")
+    print(fingerPrint)
+}
+
+// MARK: - Restore Other Windows
+
+func cmdRestoreWindows() {
+    let store = loadConfigStore()
+    guard !store.isEmpty else {
+        fputs("Skipping restore-windows: no saved data at \(CONFIG_PATH).\n", stderr)
+        return
+    }
+
+    let fingerPrint = displayFingerprint()
+
+    let saved: [String: [WindowInfo]]
+    if let match = store[fingerPrint]?.otherWindows {
+        saved = match
+    } else if store.count == 1, let only = store.values.first?.otherWindows {
+        fputs("No saved other-windows for current display layout; using the only available saved config.\n", stderr)
+        print("\nCurrent layout:\n\(fingerPrint)\n")
+        saved = only
+    } else {
+        fputs("Skipping restore-windows: no saved other-windows for current display layout.\n", stderr)
+        return
+    }
+
+    guard !saved.isEmpty else {
+        fputs("Skipping restore-windows: saved config has no other-windows.\n", stderr)
+        return
+    }
+
+    let runningByBundle: [String: NSRunningApplication] = {
+        var m: [String: NSRunningApplication] = [:]
+        for app in NSWorkspace.shared.runningApplications {
+            if let bid = app.bundleIdentifier { m[bid] = app }
+        }
+        return m
+    }()
+
+    let bundleOrder = saved.keys.sorted()
+    print("Restoring \(saved.count) app(s):\n")
+
+    var anyFailed = false
+    for (idx, bundleID) in bundleOrder.enumerated() {
+        let savedWindows = saved[bundleID] ?? []
+        guard let app = runningByBundle[bundleID] else {
+            print("[\(idx+1)/\(bundleOrder.count)] \(bundleID)  ⚠ not running, skipped")
+            anyFailed = true
+            continue
+        }
+
+        let appEl = AXUIElementCreateApplication(app.processIdentifier)
+        applyAXTimeout(appEl)
+        guard let currentWindows = axGetArray(appEl, "AXWindows"), !currentWindows.isEmpty else {
+            print("[\(idx+1)/\(bundleOrder.count)] \(bundleID)  ⚠ no open windows, skipped")
+            anyFailed = true
+            continue
+        }
+
+        print("[\(idx+1)/\(bundleOrder.count)] \(bundleID)  (\(savedWindows.count) saved, \(currentWindows.count) open)")
+
+        let n = min(savedWindows.count, currentWindows.count)
+        for i in 0..<n {
+            let target = savedWindows[i]
+            let win = currentWindows[i]
+
+            let resolvedPos = resolveGlobalPosition(from: target)
+            let fallbackPos = CGPoint(x: target.x, y: target.y)
+            let globalPos = isPositionOnScreen(resolvedPos) ? resolvedPos : fallbackPos
+
+            print("  [\(i+1)/\(savedWindows.count)]")
+            let ok = applyWindowGeometry(win, target: target, globalPos: globalPos)
+            if !ok { anyFailed = true }
+        }
+        if currentWindows.count > savedWindows.count {
+            print("  \(currentWindows.count - savedWindows.count) extra open window(s) left in place")
+        } else if savedWindows.count > currentWindows.count {
+            print("  \(savedWindows.count - currentWindows.count) extra saved window(s) have no current match")
+        }
+        print("")
+    }
+
+    if anyFailed {
+        exit(1)
+    }
+}
+
 // MARK: - Save All
 
 func runSubCommand(_ args: [String]) -> Int32 {
@@ -2095,7 +2260,10 @@ func cmdSaveAll(port: Int) {
     print("")
     stageLog(t0, "save-vivaldi-zoom")
     let zr = runSubCommand(["save-vivaldi-zoom", String(CODESERVER_PORT)])
-    if lr != 0 || wr != 0 || cr != 0 || vr != 0 || zr != 0 { exit(1) }
+    print("")
+    stageLog(t0, "save-windows")
+    let owr = runSubCommand(["save-windows"])
+    if lr != 0 || wr != 0 || cr != 0 || vr != 0 || zr != 0 || owr != 0 { exit(1) }
 
     print("")
     stageLog(t0, "vivaldi-title-split")
@@ -2123,9 +2291,13 @@ func cmdRestoreAll(port: Int) {
     let zr = runSubCommand(["restore-vivaldi-zoom", String(CODESERVER_PORT)])
     print("")
     Thread.sleep(forTimeInterval: 0.1)
+    stageLog(t0, "restore-windows")
+    let owr = runSubCommand(["restore-windows"])
+    print("")
+    Thread.sleep(forTimeInterval: 0.1)
     stageLog(t0, "restore-codeserver-layout")
     let cr = runSubCommand(["restore-codeserver-layout", String(CODESERVER_PORT)])
-    if wr != 0 || lr != 0 || vr != 0 || zr != 0 || cr != 0 { exit(1) }
+    if wr != 0 || lr != 0 || vr != 0 || zr != 0 || cr != 0 || owr != 0 { exit(1) }
 
     print("")
     stageLog(t0, "vivaldi-title-split")
@@ -2161,6 +2333,8 @@ func usage() -> Never {
     print("  \(prog) restore-vivaldi [port] Restore Vivaldi tab-bar width & window geometry")
     print("  \(prog) save-vivaldi-zoom [port]    Save Vivaldi UI zoom & default page zoom")
     print("  \(prog) restore-vivaldi-zoom [port] Restore Vivaldi UI zoom, default zoom, and apply it to all tabs")
+    print("  \(prog) save-windows           Save pos & size of all other open GUI app windows")
+    print("  \(prog) restore-windows        Apply saved geometry to windows of already-running apps")
     print("  \(prog) vivaldi-tab-numbers [port]  Enable tab order numbers in Vivaldi's tab bar")
     print("  \(prog) save-all [port]        Save both window and layout in one call")
     print("  \(prog) restore-all [port]     Restore window then layout with proper timing")
@@ -2206,6 +2380,10 @@ case "save-vivaldi-zoom":
     cmdSaveVivaldiZoom(port: codeServerPort())
 case "restore-vivaldi-zoom":
     cmdRestoreVivaldiZoom(port: codeServerPort())
+case "save-windows":
+    cmdSaveWindows()
+case "restore-windows":
+    cmdRestoreWindows()
 case "vivaldi-tab-numbers":
     cmdVivaldiTabNumbers(port: codeServerPort())
 case "save-all":
