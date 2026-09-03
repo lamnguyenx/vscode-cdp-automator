@@ -11,7 +11,7 @@ async function targets() {
 }
 
 const NEW_H = 38;
-const GAP = 40;
+const GAP = 0;
 const HEIGHT_CSS = `.tab-strip .tab-position { --Height: ${NEW_H}px !important; }`;
 // IMPORTANT: never mutate `.title` children — Vivaldi's framework owns that text
 // node, and overwriting .innerHTML makes a later framework re-render (e.g. the
@@ -28,7 +28,7 @@ const STYLE = `
 .tab-strip .tab-position .title::after { content: var(--tsub, ""); display: block; color: inherit; font-weight: 400; font-size: 12px; line-height: 1; }
 .tab-header { height: auto !important; flex-basis: auto !important; overflow: visible !important; } .tab-position .tab { height: auto !important; flex-basis: auto !important; max-height: none !important; overflow: visible !important; justify-content: center !important; padding: 2px 0 !important; }
 .tab-strip .tab-position { border-bottom: 1px solid rgba(255,255,255,0.12); }
-.tab-strip .tab-position.tab-group-end { border-bottom: 1px solid rgba(255,255,255,0.45); }
+.tab-strip .tab-position.tab-group-end { border-bottom: 2px solid var(--colorAccentBg, #aaa); }
 .tab-strip { border-right: none !important; }
 #tabs-tabbar-container { border-right: 1px solid rgba(255,255,255,0.18) !important; }
 ${HEIGHT_CSS}
