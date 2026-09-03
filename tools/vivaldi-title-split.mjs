@@ -2,8 +2,33 @@
 // Injects CSS and JS into window.html CDP target.
 // Usage:  node vivaldi-title-split.mjs [on|off|status]   (default: on)
 
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
+
 const arg = process.argv[2] ?? 'on';
 const PORT = Number(process.env.CDP_PORT) || 9222;
+
+// Persist the refresh button's position per CDP port (XDG config dir).
+const xdgConfig = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
+const btnPosFile = join(xdgConfig, 'vscode-cdp-automator', 'vivaldi-tab-split', `btn-pos-${PORT}.json`);
+
+function readBtnPos() {
+  try {
+    if (existsSync(btnPosFile)) {
+      const p = JSON.parse(readFileSync(btnPosFile, 'utf8'));
+      if (typeof p.left === 'number' && typeof p.top === 'number') return p;
+    }
+  } catch (err) {}
+  return null;
+}
+
+function writeBtnPos(left, top) {
+  try {
+    mkdirSync(join(btnPosFile, '..'), { recursive: true });
+    writeFileSync(btnPosFile, JSON.stringify({ left, top, port: PORT }, null, 2));
+  } catch (err) {}
+}
 
 async function targets() {
   const list = await fetch(`http://127.0.0.1:${PORT}/json/list`).then(r => r.json());
@@ -31,6 +56,9 @@ const STYLE = `
 .tab-strip .tab-position.tab-group-end { border-bottom: 2px solid var(--colorAccentBg, #aaa); }
 .tab-strip { border-right: none !important; }
 #tabs-tabbar-container { border-right: 1px solid rgba(255,255,255,0.18) !important; }
+#tab-split-refresh-btn { position: fixed; bottom: 43px; width: 30px; height: 30px; min-width: 30px; border: 1px solid var(--colorFg, #fff); border-radius: 8px; background: rgba(0, 0, 0, 0); color: var(--colorFg, #fff); font-size: 16px; cursor: grab; z-index: 9999; opacity: 0.9; line-height: 1; display: flex; align-items: center; justify-content: center; padding: 0; user-select: none; touch-action: none; box-sizing: border-box; }
+#tab-split-refresh-btn:active { cursor: grabbing; }
+#tab-split-refresh-btn:hover { background: rgba(255, 255, 255, 0.12); opacity: 1; }
 ${HEIGHT_CSS}
 `.trim();
 
@@ -63,6 +91,7 @@ const apply = async (t) => {
   } else if (arg === 'off') {
     await ev(`(() => {
       document.getElementById('tab-title-split')?.remove();
+      document.getElementById('tab-split-refresh-btn')?.remove();
       document.getElementById('tab-order-numbers')?.remove();
       window._tabSplitObserver?.disconnect(); delete window._tabSplitObserver;
       if (window._tabSplitInterval) { clearInterval(window._tabSplitInterval); delete window._tabSplitInterval; }
@@ -74,7 +103,7 @@ const apply = async (t) => {
         pos.classList.remove('tab-group-end');
       });
       document.querySelectorAll('.tab-strip .tab-position .title').forEach(t => {
-        // During on we never mutate the .title children — only set font-size:0
+        // During on we never mutate .title children — only set font-size:0
         // on the element so the live text hides behind pseudo-elements. So there
         // is nothing to restore here; just drop the stale cache attribute.
         t.removeAttribute('data-orig-title');
@@ -85,7 +114,9 @@ const apply = async (t) => {
     })()`);
     console.log(`${t.id.slice(0, 8)}: off`);
   } else {
+    const savedPos = readBtnPos();
     await ev(`(() => {
+      const SAVED_POS = ${JSON.stringify(savedPos)};
       const old = document.getElementById('tab-title-split');
       if (old) old.remove();
       const style = document.createElement('style');
@@ -154,11 +185,124 @@ const apply = async (t) => {
         }
       };
       applyTabSplit();
+      // inject refresh button — remove any stale one (may carry old handlers)
+      const oldBtn = document.getElementById('tab-split-refresh-btn');
+      if (oldBtn) oldBtn.remove();
+      const btn = document.createElement('button');
+      btn.id = 'tab-split-refresh-btn';
+      btn.textContent = '↻';
+      btn.title = 'Refresh tab split layout';
+      // drag to reposition (threshold 4px distinguishes drag from click)
+      // Uses Pointer Events + setPointerCapture so the button keeps receiving
+      // moves even when the cursor outruns its 30px box (Vivaldi hit-tests the
+      // coords, not the moved element — without capture, moves beyond the box
+      // are delivered to whatever is underneath instead).
+      let dragState = null;
+      let wasDragged = false;
+      const savePos = () => {
+        try {
+          window._tabSplitBtnPos = { left: parseFloat(btn.style.left), top: parseFloat(btn.style.top) };
+        } catch (err) {}
+      };
+      const snapToEdge = () => {
+        const w = window.innerWidth, h = window.innerHeight;
+        const bw = btn.offsetWidth, bh = btn.offsetHeight;
+        const cx = btn.offsetLeft + bw / 2, cy = btn.offsetTop + bh / 2;
+        const m = 4;  // margin from the edge
+        const clampX = (x) => Math.max(m, Math.min(x, w - bw - m));
+        const clampY = (y) => Math.max(m, Math.min(y, h - bh - m));
+        const dLeft = cx, dRight = w - cx, dTop = cy, dBottom = h - cy;
+        const min = Math.min(dLeft, dRight, dTop, dBottom);
+        if (min === dLeft) {
+          btn.style.left = m + 'px';
+          btn.style.top = clampY(cy - bh / 2) + 'px';
+        } else if (min === dRight) {
+          btn.style.left = (w - bw - m) + 'px';
+          btn.style.top = clampY(cy - bh / 2) + 'px';
+        } else if (min === dTop) {
+          btn.style.top = m + 'px';
+          btn.style.left = clampX(cx - bw / 2) + 'px';
+        } else {
+          btn.style.top = (h - bh - m) + 'px';
+          btn.style.left = clampX(cx - bw / 2) + 'px';
+        }
+        btn.style.bottom = 'auto';
+        savePos();
+      };
+      btn.addEventListener('pointerdown', (e) => {
+        e.stopPropagation();
+        // NOTE: no preventDefault — it cancels the drag gesture and CDP stops
+        // delivering mousemove/pointermove. user-select:none handles selection.
+        btn.setPointerCapture(e.pointerId);
+        const startX = e.clientX, startY = e.clientY;
+        const origLeft = btn.offsetLeft, origTop = btn.offsetTop;
+        dragState = { startX, startY, origLeft, origTop, moved: false };
+        wasDragged = false;
+      });
+      // window-capture fallback: CDP-synthesized mouse events don't respect
+      // setPointerCapture in Vivaldi's window.html, so moves may not reach the
+      // button. A capture-phase window mousemove sees every move regardless.
+      window.addEventListener('mousemove', (e) => {
+        if (!dragState) return;
+        const dx = e.clientX - dragState.startX, dy = e.clientY - dragState.startY;
+        if (Math.abs(dx) > 4 || Math.abs(dy) > 4) dragState.moved = true;
+        btn.style.left = (dragState.origLeft + dx) + 'px';
+        btn.style.top = (dragState.origTop + dy) + 'px';
+        btn.style.bottom = 'auto';
+      }, true);
+      btn.addEventListener('pointermove', (e) => {
+        if (!dragState) return;
+        const dx = e.clientX - dragState.startX, dy = e.clientY - dragState.startY;
+        if (Math.abs(dx) > 4 || Math.abs(dy) > 4) dragState.moved = true;
+        btn.style.left = (dragState.origLeft + dx) + 'px';
+        btn.style.top = (dragState.origTop + dy) + 'px';
+        btn.style.bottom = 'auto';
+      });
+      btn.addEventListener('pointerup', (e) => {
+        if (!dragState) return;
+        wasDragged = !!dragState.moved;
+        dragState = null;
+        if (e.pointerId !== undefined) { try { btn.releasePointerCapture(e.pointerId); } catch (err) {} }
+        if (wasDragged) snapToEdge();
+      });
+      window.addEventListener('mouseup', (e) => {
+        if (!dragState) return;
+        wasDragged = !!dragState.moved;
+        dragState = null;
+        if (wasDragged) snapToEdge();
+      }, true);
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (wasDragged) { wasDragged = false; return; }  // drag, not click
+        applyTabSplit();
+      });
+      document.body.appendChild(btn);
+      // initial position: restore saved position (from XDG file, injected as
+      // SAVED_POS), else default = left-aligned + vertically centered.
+      if (SAVED_POS && typeof SAVED_POS.left === 'number' && typeof SAVED_POS.top === 'number') {
+        btn.style.left = SAVED_POS.left + 'px';
+        btn.style.top = SAVED_POS.top + 'px';
+        btn.style.bottom = 'auto';
+      } else {
+        const bw = btn.offsetWidth, bh = btn.offsetHeight;
+        btn.style.left = '4px';
+        btn.style.top = Math.max(4, Math.round((window.innerHeight - bh) / 2)) + 'px';
+        btn.style.bottom = 'auto';
+      }
       // manual rerun only — clean up any previous auto observers/intervals
       if (window._tabSplitObserver) { window._tabSplitObserver.disconnect(); delete window._tabSplitObserver; }
       if (window._tabSplitInterval) { clearInterval(window._tabSplitInterval); delete window._tabSplitInterval; }
       return 'ok';
     })()`);
+    // persist the button's latest position (the page stashes it in
+    // _tabSplitBtnPos on every drag end) so the next `on` restores it.
+    const cur = await ev(`(() => window._tabSplitBtnPos ? JSON.stringify(window._tabSplitBtnPos) : null)()`);
+    if (cur) {
+      try {
+        const p = JSON.parse(cur);
+        if (typeof p.left === 'number' && typeof p.top === 'number') writeBtnPos(p.left, p.top);
+      } catch (err) {}
+    }
     console.log(`${t.id.slice(0, 8)}: on`);
   }
   ws.close();
