@@ -15,8 +15,8 @@ Produces `vscode-ui-resizer/vscode-ui-resizer.exe`.
 Default CDP ports: **9333** for VS Code, **9222** for code-server / Vivaldi.
 
 ```
-vscode-ui-resizer.exe save-win                        Save frontmost VS Code window pos & size
-vscode-ui-resizer.exe restore-win [port]              Apply to all VS Code windows
+vscode-ui-resizer.exe save-win                        Save all open VS Code windows pos & size (title-matched on restore)
+vscode-ui-resizer.exe restore-win [port]              Apply to all VS Code windows (title-first, positional fallback)
 vscode-ui-resizer.exe save-layout [port]              Save sidebar/panel widths + zoom
 vscode-ui-resizer.exe restore-layout [port]           Restore to all VS Code windows
 vscode-ui-resizer.exe save-codeserver-layout [port]   Save active code-server tab layout
@@ -26,24 +26,26 @@ vscode-ui-resizer.exe restore-vivaldi [port]          Restore Vivaldi window + t
 vscode-ui-resizer.exe save-vivaldi-zoom [port]        Save Vivaldi UI + default page zoom
 vscode-ui-resizer.exe restore-vivaldi-zoom [port]     Restore zoom and apply to every tab
 vscode-ui-resizer.exe save-windows                    Save pos & size of all other open GUI app windows
-vscode-ui-resizer.exe restore-windows                 Apply saved geometry to windows of already-running apps
+vscode-ui-resizer.exe restore-windows                 Apply saved geometry to windows of already-running apps (title-matched)
 vscode-ui-resizer.exe vivaldi-tab-numbers [port]      Inject tab-order numbers into tab strip
-vscode-ui-resizer.exe save-all [port]                 Run all save steps in sequence
-vscode-ui-resizer.exe restore-all [port]              Run all restore steps in sequence
+vscode-ui-resizer.exe save-all [port]                 Run all save steps in sequence (in-process)
+vscode-ui-resizer.exe restore-all [port]              Run all restore steps in sequence (in-process)
 vscode-ui-resizer.exe list-displays                   Print connected screens
 ```
 
+Exit codes: `0` ok, `1` failed, `2` precondition (AX denied / CDP unreachable / no saved data). `save-all` / `restore-all` report per-stage `OK/FAILED/SKIPPED` and fail only on real failures (skips don't fail). All commands accept `--verbose` for AX/CDP diagnostics.
+
 ## Config
 
-Single store at `~/.config/vscode-cdp-automator/config.json`, keyed by a display fingerprint (frame, pixel size, rotation, name of every screen). Each entry keeps `window`, `layout`, `codeServerLayout`, `vivaldi`, and `otherWindows` (a `bundleID -> [window]` map for every other GUI app, restored positionally by index). Legacy configs under `~/.config/vscode/` are auto-migrated on first load.
+Single store at `~/.config/vscode-cdp-automator/config.json`, keyed by a display fingerprint v2 (`[x,y] WxHpt @Scalex rot° name`, points + scale; v1 pixel-size keys read as legacy alias). Each entry keeps `window` (legacy first window) + `windows` (all VS Code windows), `layout`, `codeServerLayout`, `vivaldi`, and `otherWindows` (a `bundleID -> [window]` map for every other GUI app, restored title-first with positional fallback). Legacy configs under `~/.config/vscode/` are auto-migrated on first load. Corrupt main config is never overwritten — it logs and uses an empty store.
 
 ## How it works
 
-- **Window position/size** — macOS Accessibility API (`AXPosition` / `AXSize`), with up to 5 retries at 3px tolerance.
-- **VS Code sidebar/panel widths** — CDP `Runtime.evaluate` discovery of Monaco sash indices, then synthetic `MouseEvent` `mousedown → mousemove → mouseup` on `window` (VS Code sashes listen for plain MouseEvents).
+- **Window position/size** — macOS Accessibility API (`AXPosition` / `AXSize`), with up to 5 retries at 3px tolerance. Restores clamp to a visible screen (matched → raw → clamped) and never place windows off-screen invisibly. Requires Accessibility permission (exit 2 with hint otherwise).
+- **VS Code sidebar/panel widths** — CDP `Runtime.evaluate` discovery of Monaco sash indices, then synthetic `MouseEvent` `mousedown → mousemove → mouseup` on `window` (VS Code sashes listen for plain MouseEvents). Sash-mapping misses abort instead of guessing indices.
 - **Vivaldi tab bar** — CDP `Input.dispatchMouseEvent` (trusted input), because Vivaldi's resize handle calls `setPointerCapture` and rejects synthetic events.
-- **Zoom** — VS Code: regex-edit of `settings.json` `window.zoomLevel`; Vivaldi: `window.vivaldi.zoom` + `chrome.tabs.setZoom` over `window.html` target.
-- **Other windows** — every running `.regular` GUI app (excluding VS Code + Vivaldi) has its windows enumerated via `AXWindows`, keyed by `bundleIdentifier` and stored positionally. Restore only positions windows of apps already running; absent apps log a warning and are skipped (never launched).
+- **Zoom** — VS Code: backup + JSONC-tolerant edit of `settings.json` `window.zoomLevel` (validates before/after, restores backup on failure); Vivaldi: `window.vivaldi.zoom` + `chrome.tabs.setZoom` over `window.html` target.
+- **Other windows** — every running `.regular` GUI app (excluding VS Code + Vivaldi) has its windows enumerated via `AXWindows`, keyed by `bundleIdentifier` and stored positionally. Restore is title-first with positional fallback. Restore only positions windows of apps already running; absent apps log a warning and are skipped (never launched).
 - **Eligibility gating** — windows are skipped unless sidebar-left / panel-right / not-maximized, so orthogonal layouts are never clobbered.
 
 ## Tools

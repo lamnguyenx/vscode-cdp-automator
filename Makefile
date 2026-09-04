@@ -2,8 +2,8 @@
 
 vscode-ui-resizer: vscode-ui-resizer/vscode-ui-resizer.exe
 
-vscode-ui-resizer/vscode-ui-resizer.exe: vscode-ui-resizer/vscode-ui-resizer.swift
-	swiftc -o vscode-ui-resizer/vscode-ui-resizer.exe vscode-ui-resizer/vscode-ui-resizer.swift
+vscode-ui-resizer/vscode-ui-resizer.exe: vscode-ui-resizer/*.swift
+	swiftc -o vscode-ui-resizer/vscode-ui-resizer.exe vscode-ui-resizer/*.swift
 	@echo "Built vscode-ui-resizer/vscode-ui-resizer.exe"
 
 clean:
