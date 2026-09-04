@@ -209,7 +209,7 @@ func cmdSaveVivaldi(port: Int) -> Int32 {
     if let (win, title, pid) = findFrontmostVivaldiWindow(),
        let pos = axGetPoint(win, "AXPosition"),
        let size = axGetSize(win, "AXSize") {
-        let (screenFrame, relX, relY, _) = describeScreen(containing: pos)
+        let (screenFrame, relX, relY, _) = describeScreen(containing: pos, size: size)
         winInfo = WindowInfo(
             title: title,
             pid: pid,
@@ -286,9 +286,9 @@ func cmdRestoreVivaldi(port: Int) -> Int32 {
                 win,
                 target: target,
                 globalPos: globalPos,
-                maxRetries: 3,
-                firstSleep: 0.1,
-                retrySleep: 0.15,
+                maxRetries: 5,
+                firstSleep: 0.15,
+                retrySleep: 0.25,
                 verboseFullscreen: false
             )
             print("")

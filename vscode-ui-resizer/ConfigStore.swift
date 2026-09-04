@@ -212,9 +212,30 @@ func clampToVisible(_ pt: CGPoint, size: CGSize) -> (point: CGPoint, source: Pos
     return (pt, .rawFallback)
 }
 
+func screenMatchingFrame(_ frameStr: String) -> NSScreen? {
+    return NSScreen.screens.first(where: { screenFrameString($0.frame) == frameStr })
+}
+
 func resolveAndClamp(from info: WindowInfo) -> (point: CGPoint, source: PositionSource) {
     let (pt, src) = resolveGlobalPosition(from: info)
     if isPositionOnScreen(pt) { return (pt, src) }
+    // Matched-screen path: arrangement is the same as at save time, so trust
+    // saved coords within tolerance. Strict contains() rejects near-misses
+    // (menu-bar gap ~27px, exclusive max edges) that were valid at save;
+    // clamping those to main moves windows to the wrong display.
+    if src == .matched, let screen = screenMatchingFrame(info.screenFrame) {
+        let f = screen.frame
+        let tol: CGFloat = 60
+        if f.insetBy(dx: -tol, dy: -tol).contains(pt) { return (pt, src) }
+        let rect = CGRect(origin: pt, size: CGSize(width: info.width, height: info.height))
+        if !f.intersection(rect).isNull { return (pt, src) }
+        // Genuinely off its screen: clamp into it, not main.
+        let vf = screen.visibleFrame
+        let margin: CGFloat = 50
+        let x = min(max(pt.x, vf.minX), max(vf.minX, vf.maxX - margin))
+        let y = min(max(pt.y, vf.minY), max(vf.minY, vf.maxY - margin))
+        return (CGPoint(x: x, y: y), .clamped)
+    }
     let fallback = CGPoint(x: info.x, y: info.y)
     if isPositionOnScreen(fallback) { return (fallback, .rawFallback) }
     let size = CGSize(width: info.width, height: info.height)

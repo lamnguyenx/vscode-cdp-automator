@@ -215,7 +215,7 @@ func writeZoomLevelToUserSettings(_ level: Double) -> Bool {
 func makeWindowInfo(title: String, pid: pid_t, pos: CGPoint, size: CGSize) -> WindowInfo {
     var label = normalizedTitle(title)
     if label.isEmpty { label = "untitled" }
-    let (screenFrame, relX, relY, _) = describeScreen(containing: pos)
+    let (screenFrame, relX, relY, _) = describeScreen(containing: pos, size: size)
     return WindowInfo(
         title: title,
         pid: pid,

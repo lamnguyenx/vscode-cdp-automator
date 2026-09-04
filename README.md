@@ -41,7 +41,7 @@ Single store at `~/.config/vscode-cdp-automator/config.json`, keyed by a display
 
 ## How it works
 
-- **Window position/size** — macOS Accessibility API (`AXPosition` / `AXSize`), with up to 5 retries at 3px tolerance. Restores clamp to a visible screen (matched → raw → clamped) and never place windows off-screen invisibly. Requires Accessibility permission (exit 2 with hint otherwise).
+- **Window position/size** — macOS Accessibility API (`AXPosition` / `AXSize`), verified by read-back at 3px tolerance (sets report success even when silently dropped, and width/height can fail independently). Save classifies the display size-aware: exact top-left hit → largest window-rect overlap → nearest screen, so edge-sitting windows are never stored `off-screen` while displays exist. Restore trusts fingerprint-matched coordinates within 60px (clamping into the *matched* screen, never main), and `applyWindowGeometry` breaks display-fill/maximized state with one large height change before walking size in ≤400px steps — large single jumps are silently ignored, so spanning restores converge instead of sticking on one display. Requires Accessibility permission (exit 2 with hint otherwise). See [2026-09-04 restore geometry round-trip bug](docs/issues/bugs/2026/09/04/2026-09-04-restore-window-geometry-roundtrip-CLOSED.md).
 - **VS Code sidebar/panel widths** — CDP `Runtime.evaluate` discovery of Monaco sash indices, then synthetic `MouseEvent` `mousedown → mousemove → mouseup` on `window` (VS Code sashes listen for plain MouseEvents). Sash-mapping misses abort instead of guessing indices.
 - **Vivaldi tab bar** — CDP `Input.dispatchMouseEvent` (trusted input), because Vivaldi's resize handle calls `setPointerCapture` and rejects synthetic events.
 - **Zoom** — VS Code: backup + JSONC-tolerant edit of `settings.json` `window.zoomLevel` (validates before/after, restores backup on failure); Vivaldi: `window.vivaldi.zoom` + `chrome.tabs.setZoom` over `window.html` target.
@@ -131,4 +131,4 @@ VS Code / Electron / Vivaldi must be started with `--remote-debugging-port=<port
 Field notes and implementation logs live under `docs/`:
 
 - `docs/important/` — durable references: Vivaldi CDP/prefs quirks, zoom APIs, tab-bar resize mechanics, tab-strip customization.
-- `docs/lessons/`, `docs/plans/`, `docs/issues/bugs/` — dated writeups.
+- `docs/lessons/`, `docs/plans/`, `docs/issues/bugs/` — dated writeups, e.g. [2026-09-04 restore window geometry round-trip](docs/issues/bugs/2026/09/04/2026-09-04-restore-window-geometry-roundtrip-CLOSED.md) (off-screen misclassification, matched-screen clamping, maximized break-fill + stepped resize).

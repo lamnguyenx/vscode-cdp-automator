@@ -3,17 +3,52 @@ import Foundation
 
 // MARK: - Screen Description
 
-func describeScreen(containing point: CGPoint) -> (frame: String, relativeX: Double, relativeY: Double, onScreen: Bool) {
-    for screen in NSScreen.screens {
+func describeScreen(containing point: CGPoint, size: CGSize? = nil) -> (frame: String, relativeX: Double, relativeY: Double, onScreen: Bool) {
+    let screens = NSScreen.screens
+    // 1. Exact top-left hit (existing behavior).
+    for screen in screens {
         if screen.frame.contains(point) {
             let f = screen.frame
-            let frameStr = screenFrameString(f)
-            let rx = Double(point.x - f.origin.x)
-            let ry = Double(point.y - f.origin.y)
-            return (frameStr, rx, ry, true)
+            return (screenFrameString(f), Double(point.x - f.origin.x), Double(point.y - f.origin.y), true)
         }
     }
+    // 2. Largest window-rect overlap (handles top-left just outside, e.g. menu-bar
+    // gap or bottom-edge-exclusive misses like Ghostty/Tailscale/Gemini).
+    if let size, size.width > 0, size.height > 0 {
+        let rect = CGRect(origin: point, size: size)
+        var best: NSScreen?
+        var bestArea: CGFloat = 0
+        for screen in screens {
+            let inter = screen.frame.intersection(rect)
+            if !inter.isNull {
+                let area = inter.width * inter.height
+                if area > bestArea {
+                    bestArea = area
+                    best = screen
+                }
+            }
+        }
+        if let hit = best, bestArea > 0 {
+            let f = hit.frame
+            return (screenFrameString(f), Double(point.x - f.origin.x), Double(point.y - f.origin.y), true)
+        }
+    }
+    // 3. Nearest screen by edge distance (covers zero-overlap edge cases, e.g.
+    // window top exactly on a screen's exclusive max edge). Never return
+    // "off-screen" while displays exist, so restore has a frame to match.
+    if let nearest = screens.min(by: {
+        edgeDistance(point, $0.frame) < edgeDistance(point, $1.frame)
+    }) {
+        let f = nearest.frame
+        return (screenFrameString(f), Double(point.x - f.origin.x), Double(point.y - f.origin.y), false)
+    }
     return ("off-screen", Double(point.x), Double(point.y), false)
+}
+
+func edgeDistance(_ p: CGPoint, _ r: NSRect) -> CGFloat {
+    let dx = max(r.minX - p.x, 0, p.x - r.maxX)
+    let dy = max(r.minY - p.y, 0, p.y - r.maxY)
+    return dx * dx + dy * dy
 }
 
 // MARK: - Display Fingerprint (v2: points + scale, v1 legacy alias)

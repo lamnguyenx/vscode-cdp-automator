@@ -23,7 +23,7 @@ func cmdSaveWindows() -> Int32 {
             else { continue }
 
             let title = axGetString(win, "AXTitle") ?? ""
-            let (screenFrame, relX, relY, _) = describeScreen(containing: pos)
+            let (screenFrame, relX, relY, _) = describeScreen(containing: pos, size: size)
             let label = title.isEmpty ? bundleID : title
 
             infos.append(WindowInfo(

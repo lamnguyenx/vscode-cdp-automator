@@ -138,9 +138,48 @@ func applyWindowGeometry(
     }
 
     var ok = false
+    // Break display-fill (maximized) state first: a window filling its display
+    // (both dims ≈ display size) silently drops size changes, snapping back to
+    // fill — even small stepped ones. A single large height change escapes the
+    // fill state, after which the stepped walk below converges (verified).
+    if let curSize0 = axGetSize(win, "AXSize"), let curPos0 = axGetPoint(win, "AXPosition") {
+        let scr = NSScreen.screens.first(where: { $0.frame.contains(curPos0) })
+            ?? NSScreen.screens.min(by: { edgeDistance(curPos0, $0.frame) < edgeDistance(curPos0, $1.frame) })
+        if let f = scr?.frame,
+           abs(curSize0.width - f.width) < 60 && abs(curSize0.height - f.height) < 60 {
+            let breakH = max(400.0, curSize0.height - 900.0)
+            if abs(breakH - curSize0.height) > 100 {
+                _ = axSetSize(win, "AXSize", CGSize(width: curSize0.width, height: breakH))
+                Thread.sleep(forTimeInterval: 0.4)
+            }
+        }
+    }
     for attempt in 1...maxRetries {
         let posSet = axSetPoint(win, "AXPosition", globalPos)
-        let sizeSet = axSetSize(win, "AXSize", CGSize(width: target.width, height: target.height))
+        // Grow/shrink large size deltas incrementally: big single AXSize jumps
+        // (roughly 800px+ on width, e.g. single-display -> 3-display span) are
+        // silently ignored, while steps of ~400px apply reliably. Walk the
+        // size up so each step commits before the next begins.
+        let targetSize = CGSize(width: target.width, height: target.height)
+        var sizeSet = true
+        if let curSize = axGetSize(win, "AXSize") {
+            let dw = targetSize.width - curSize.width
+            let dh = targetSize.height - curSize.height
+            let steps = max(1, Int(ceil(max(abs(dw) / 400.0, abs(dh) / 400.0))))
+            if steps > 1 {
+                for s in 1...steps {
+                    let t = Double(s) / Double(steps)
+                    let interim = CGSize(width: curSize.width + dw * t,
+                                         height: curSize.height + dh * t)
+                    sizeSet = axSetSize(win, "AXSize", interim) && sizeSet
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+            } else {
+                sizeSet = axSetSize(win, "AXSize", targetSize)
+            }
+        } else {
+            sizeSet = axSetSize(win, "AXSize", targetSize)
+        }
         if !posSet || !sizeSet {
             // .notAllowed / .invalidUIElement are permanent; don't burn retries.
             if verboseLogging {
