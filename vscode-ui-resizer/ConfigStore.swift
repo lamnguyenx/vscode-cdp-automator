@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import Yams
 
 // MARK: - Constants
 
@@ -13,7 +14,8 @@ let VSCODE_BUNDLES = [
 
 let VIVALDI_BUNDLE_ID = "com.vivaldi.Vivaldi"
 
-let CONFIG_PATH = NSString(string: "~/.config/vscode-cdp-automator/config.json").expandingTildeInPath
+let CONFIG_PATH = NSString(string: "~/.config/vscode-cdp-automator/config.yaml").expandingTildeInPath
+let LEGACY_JSON_CONFIG_PATH = NSString(string: "~/.config/vscode-cdp-automator/config.json").expandingTildeInPath
 let LEGACY_WIN_CONFIG_PATH = NSString(string: "~/.config/vscode/windows.json").expandingTildeInPath
 let LEGACY_LAYOUT_CONFIG_PATH = NSString(string: "~/.config/vscode/panel-and-bar-sides.json").expandingTildeInPath
 let USER_SETTINGS_PATH = NSString(string: "~/Library/Application Support/Code/User/settings.json").expandingTildeInPath
@@ -25,7 +27,7 @@ let EXIT_OK: Int32 = 0
 let EXIT_FAILED: Int32 = 1
 let EXIT_PRECONDITION: Int32 = 2
 
-var verboseLogging = false
+nonisolated(unsafe) var verboseLogging = false
 
 // MARK: - Window Data
 
@@ -70,6 +72,29 @@ struct VivaldiConfig: Codable {
     var defaultZoom: Double?
 }
 
+struct MonitorEntry: Codable {
+    let id: String
+    let contextual_id: String?
+    let serial_id: String?
+    let type: String?
+    let resolution: String
+    let hertz: Int
+    let color_depth: Int
+    let scaling: String
+    let origin: MonitorOrigin
+    let rotation: Int
+    let enabled: Bool
+}
+
+struct MonitorOrigin: Codable {
+    let x: Int
+    let y: Int
+}
+
+struct DisplayLayout: Codable {
+    let displays: [MonitorEntry]
+}
+
 struct DisplayConfig: Codable {
     var window: WindowInfo? = nil
     var windows: [WindowInfo]? = nil
@@ -77,42 +102,83 @@ struct DisplayConfig: Codable {
     var codeServerLayout: LayoutConfig? = nil
     var vivaldi: VivaldiConfig? = nil
     var otherWindows: [String: [WindowInfo]]? = nil
+    var monitors: DisplayLayout? = nil
+}
+
+func migrateOldJSON() {
+    let fm = FileManager.default
+    let jsonPath = LEGACY_JSON_CONFIG_PATH
+    guard fm.fileExists(atPath: jsonPath) else { return }
+    guard !fm.fileExists(atPath: CONFIG_PATH) else {
+        // Already have YAML; remove old JSON
+        try? fm.removeItem(atPath: jsonPath)
+        return
+    }
+
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: jsonPath))
+        // Decode as generic JSON to rename displayLayout → monitors
+        if let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            var migrated = raw
+            for (key, val) in raw {
+                if var entry = val as? [String: Any] {
+                    if let dl = entry["displayLayout"] {
+                        entry["monitors"] = dl
+                        entry.removeValue(forKey: "displayLayout")
+                    }
+                    migrated[key] = entry
+                }
+            }
+            let migratedData = try JSONSerialization.data(withJSONObject: migrated)
+            let decoder = YAMLDecoder()
+            let store = try decoder.decode([String: DisplayConfig].self, from: migratedData)
+            if saveConfigStore(store) {
+                try fm.removeItem(atPath: jsonPath)
+                fputs("Migrated \(jsonPath) → \(CONFIG_PATH)\n", stderr)
+            }
+        }
+    } catch {
+        fputs("Failed to migrate \(jsonPath): \(error)\n", stderr)
+    }
 }
 
 func loadConfigStore() -> [String: DisplayConfig] {
+    migrateOldJSON()
+
     if FileManager.default.fileExists(atPath: CONFIG_PATH) {
         do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: CONFIG_PATH))
-            let store = try JSONDecoder().decode([String: DisplayConfig].self, from: data)
-            return store
+            let data = try String(contentsOf: URL(fileURLWithPath: CONFIG_PATH), encoding: .utf8)
+            let store = try YAMLDecoder().decode([String: DisplayConfig].self, from: data)
+            return pruneOldFingerprintKeys(store)
         } catch {
             fputs("Config at \(CONFIG_PATH) is corrupt (\(error)); leaving untouched, using empty store.\n", stderr)
-            return [:]
+            return pruneOldFingerprintKeys([:])
         }
     }
 
     var store: [String: DisplayConfig] = [:]
 
+    // Migrate legacy configs into the current fingerprint key
+    let fp = displayFingerprint()
+    var entry = DisplayConfig()
+
     if let data = try? Data(contentsOf: URL(fileURLWithPath: LEGACY_WIN_CONFIG_PATH)) {
         if let dict = try? JSONDecoder().decode([String: WindowInfo].self, from: data) {
-            for (key, info) in dict {
-                store[key] = DisplayConfig(window: info, layout: nil)
-            }
-        } else if let legacy = try? JSONDecoder().decode(WindowInfo.self, from: data) {
-            store["legacy"] = DisplayConfig(window: legacy, layout: nil)
+            let infos = Array(dict.values)
+            entry.windows = infos
+            entry.window = infos.first
+        } else if let win = try? JSONDecoder().decode(WindowInfo.self, from: data) {
+            entry.window = win
+            entry.windows = [win]
         }
     }
 
     if let data = try? Data(contentsOf: URL(fileURLWithPath: LEGACY_LAYOUT_CONFIG_PATH)),
        let layout = try? JSONDecoder().decode(LayoutConfig.self, from: data) {
-        if store.isEmpty {
-            store["legacy"] = DisplayConfig(window: nil, layout: layout)
-        } else {
-            for key in store.keys {
-                store[key]?.layout = layout
-            }
-        }
+        entry.layout = layout
     }
+
+    store[fp] = entry
 
     if !store.isEmpty {
         _ = saveConfigStore(store)
@@ -122,16 +188,23 @@ func loadConfigStore() -> [String: DisplayConfig] {
     return store
 }
 
-func saveConfigStore(_ store: [String: DisplayConfig]) -> Bool {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+func pruneOldFingerprintKeys(_ store: [String: DisplayConfig]) -> [String: DisplayConfig] {
+    // New keys contain a UUID fragment after " - " or starting with hex
+    let hasNewKey = store.keys.contains { $0.contains(" - ") || $0.range(of: "^[0-9A-F]{8}\\.\\.\\.", options: .regularExpression) != nil }
+    if !hasNewKey { return store }
+    // Keep only keys that look like new fingerprints
+    return store.filter { $0.key.contains(" - ") || $0.key.range(of: "^[0-9A-F]{8}\\.\\.\\.", options: .regularExpression) != nil }
+}
 
-    guard let data = try? encoder.encode(store) else { return false }
+func saveConfigStore(_ store: [String: DisplayConfig]) -> Bool {
+    let encoder = YAMLEncoder()
+
+    guard let yaml = try? encoder.encode(store) else { return false }
 
     let dir = (CONFIG_PATH as NSString).deletingLastPathComponent
     do {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        try data.write(to: URL(fileURLWithPath: CONFIG_PATH), options: .atomic)
+        try yaml.write(to: URL(fileURLWithPath: CONFIG_PATH), atomically: true, encoding: .utf8)
         return true
     } catch {
         fputs("Failed to write \(CONFIG_PATH): \(error)\n", stderr)

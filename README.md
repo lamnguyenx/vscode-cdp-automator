@@ -28,8 +28,10 @@ vscode-ui-resizer.exe restore-vivaldi-zoom [port]     Restore zoom and apply to 
 vscode-ui-resizer.exe save-windows                    Save pos & size of all other open GUI app windows
 vscode-ui-resizer.exe restore-windows                 Apply saved geometry to windows of already-running apps (title-matched)
 vscode-ui-resizer.exe vivaldi-tab-numbers [port]      Inject tab-order numbers into tab strip
-vscode-ui-resizer.exe save-all [port]                 Run all save steps in sequence (in-process)
-vscode-ui-resizer.exe restore-all [port]              Run all restore steps in sequence (in-process)
+vscode-ui-resizer.exe save-monitors                   Save physical display layout (position, rotation, resolution)
+vscode-ui-resizer.exe restore-monitors                Restore physical display layout via displayplacer
+vscode-ui-resizer.exe save-all [port]                 Run all save steps in sequence (monitors, layout, windows, vivaldi, other-windows)
+vscode-ui-resizer.exe restore-all [port]              Restore monitors first (1s settle), then windows + layout + vivaldi + other-windows
 vscode-ui-resizer.exe list-displays                   Print connected screens
 ```
 
@@ -37,7 +39,17 @@ Exit codes: `0` ok, `1` failed, `2` precondition (AX denied / CDP unreachable / 
 
 ## Config
 
-Single store at `~/.config/vscode-cdp-automator/config.json`, keyed by a display fingerprint v2 (`[x,y] WxHpt @Scalex rot° name`, points + scale; v1 pixel-size keys read as legacy alias). Each entry keeps `window` (legacy first window) + `windows` (all VS Code windows), `layout`, `codeServerLayout`, `vivaldi`, and `otherWindows` (a `bundleID -> [window]` map for every other GUI app, restored title-first with positional fallback). Legacy configs under `~/.config/vscode/` are auto-migrated on first load. Corrupt main config is never overwritten — it logs and uses an empty store.
+Single **YAML** store at `~/.config/vscode-cdp-automator/config.yaml`, keyed by a multi-line fingerprint of sorted persistent monitor UUIDs (`Name - UUID...`). Each entry keeps:
+
+| Key | Content |
+|-----|---------|
+| `monitors` | Display specs (position, rotation, resolution) for `displayplacer`-based physical layout restore |
+| `layout` | VS Code sidebar/panel/editor sizes, positions, zoom |
+| `windows` | All VS Code window geometries (title-matched on restore) |
+| `vivaldi` | Vivaldi window geometry + vertical tab bar width |
+| `otherWindows` | `bundleID → [window]` map for every other GUI app |
+
+Old JSON config (`config.json`) is auto-migrated to YAML on first read. Legacy configs under `~/.config/vscode/` are also migrated. Old positional fingerprint keys are pruned automatically after migration — run `save-all` once after upgrading to re-capture all data under the new UUID key.
 
 ## How it works
 

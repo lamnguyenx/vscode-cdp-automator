@@ -19,8 +19,10 @@ func usage() -> Never {
     print("  \(prog) [--verbose] save-windows           Save pos & size of all other open GUI app windows")
     print("  \(prog) [--verbose] restore-windows        Apply saved geometry to windows of already-running apps (title-matched)")
     print("  \(prog) [--verbose] vivaldi-tab-numbers [port]  Enable tab order numbers in Vivaldi's tab bar")
-    print("  \(prog) [--verbose] save-all [port]        Save both window and layout in one call")
-    print("  \(prog) [--verbose] restore-all [port]     Restore window then layout with proper timing")
+    print("  \(prog) [--verbose] save-monitors          Save physical display layout (position, rotation, resolution)")
+    print("  \(prog) [--verbose] restore-monitors       Restore physical display layout via displayplacer")
+    print("  \(prog) [--verbose] save-all [port]        Save monitors, layout, windows, vivaldi, other-windows")
+    print("  \(prog) [--verbose] restore-all [port]     Restore monitors first (with 1s settle), then windows + layout")
     print("  \(prog) list-displays          List connected displays with their frames")
     print("")
     print("Default CDP port: 9333")
@@ -76,6 +78,10 @@ let exitCode: Int32 = {
         return cmdRestoreWindows()
     case "vivaldi-tab-numbers":
         return cmdVivaldiTabNumbers(port: codeServerPort())
+    case "save-monitors":
+        return cmdSaveDisplayLayout()
+    case "restore-monitors":
+        return cmdRestoreDisplayLayout()
     case "save-all":
         return cmdSaveAll(port: cdpPort())
     case "restore-all":

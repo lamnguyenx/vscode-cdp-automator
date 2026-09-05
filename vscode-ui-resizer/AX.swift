@@ -211,8 +211,8 @@ func applyWindowGeometry(
 
 // MARK: - Devhost Detection
 
-private var devHostCommandCache: [pid_t: String]?
-private var devHostCommandCachePopulated = false
+nonisolated(unsafe) private var devHostCommandCache: [pid_t: String]?
+nonisolated(unsafe) private var devHostCommandCachePopulated = false
 
 func devHostCommandMap() -> [pid_t: String] {
     if let cached = devHostCommandCache { return cached }

@@ -225,6 +225,8 @@ playground.xcworkspace
 # .swiftpm
 
 .build/
+vscode-ui-resizer/.build/
+Package.resolved
 
 # CocoaPods
 # We recommend against adding the Pods directory to your .gitignore. However

@@ -102,7 +102,7 @@ func wsRecvOpt(_ task: URLSessionWebSocketTask) -> String? {
 }
 
 private let cdpIdLock = NSLock()
-private var cdpNextId: Int = 1000
+nonisolated(unsafe) private var cdpNextId: Int = 1000
 
 func nextCdpId() -> Int {
     cdpIdLock.lock()

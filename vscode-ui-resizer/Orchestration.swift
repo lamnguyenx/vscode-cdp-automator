@@ -1,6 +1,161 @@
 import Cocoa
 import Foundation
 
+// MARK: - Display Layout Save
+
+func cmdSaveDisplayLayout() -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/displayplacer")
+    p.arguments = ["list"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do {
+        try p.run()
+    } catch {
+        fputs("displayplacer not found: \(error)\n", stderr)
+        return EXIT_PRECONDITION
+    }
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else {
+        fputs("displayplacer list failed\n", stderr)
+        return EXIT_FAILED
+    }
+    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+    // Verify displayplacer produced output we can parse
+    let hasCmd = out.components(separatedBy: "\n").contains { $0.hasPrefix("displayplacer ") }
+    guard hasCmd else {
+        fputs("No displayplacer command in output\n", stderr)
+        return EXIT_FAILED
+    }
+
+    let fingerPrint = displayFingerprint()
+    var store = loadConfigStore()
+    var entry = store[fingerPrint] ?? DisplayConfig()
+
+    // Parse displayplacer list structured output into our JSON format
+    let displays = parseDisplayplacerList(out)
+    entry.monitors = DisplayLayout(displays: displays)
+
+    store[fingerPrint] = entry
+    guard saveConfigStore(store) else { return EXIT_FAILED }
+
+    print("Saved \(displays.count) display(s) to \(CONFIG_PATH)")
+    for d in displays {
+        print("  \(d.id.prefix(8))... \(d.resolution) @(\(d.origin.x),\(d.origin.y)) rot=\(d.rotation)°")
+    }
+    return EXIT_OK
+}
+
+func parseDisplayplacerList(_ text: String) -> [MonitorEntry] {
+    var displays: [MonitorEntry] = []
+    var current: (id: String?, cid: String?, sid: String?, type: String?, res: String?, hz: Int?, depth: Int?, scaling: String?, ox: Int?, oy: Int?, rot: Int?, enabled: Bool?)?
+
+    for line in text.components(separatedBy: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("Persistent screen id: ") {
+            if let c = current, let id = c.id, let res = c.res, let ox = c.ox, let oy = c.oy, let rot = c.rot, let hz = c.hz {
+                displays.append(MonitorEntry(
+                    id: id, contextual_id: c.cid, serial_id: c.sid, type: c.type,
+                    resolution: res, hertz: hz, color_depth: c.depth ?? 8,
+                    scaling: c.scaling ?? "off",
+                    origin: MonitorOrigin(x: ox, y: oy),
+                    rotation: rot, enabled: c.enabled ?? true
+                ))
+            }
+            current = (String(trimmed.dropFirst("Persistent screen id: ".count)), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+        } else if trimmed.hasPrefix("Contextual screen id: ") {
+            current?.cid = String(trimmed.dropFirst("Contextual screen id: ".count))
+        } else if trimmed.hasPrefix("Serial screen id: ") {
+            current?.sid = String(trimmed.dropFirst("Serial screen id: ".count))
+        } else if trimmed.hasPrefix("Type: ") {
+            current?.type = String(trimmed.dropFirst("Type: ".count))
+        } else if trimmed.hasPrefix("Resolution: ") {
+            current?.res = String(trimmed.dropFirst("Resolution: ".count))
+        } else if trimmed.hasPrefix("Hertz: ") {
+            current?.hz = Int(String(trimmed.dropFirst("Hertz: ".count)))
+        } else if trimmed.hasPrefix("Color Depth: ") {
+            current?.depth = Int(String(trimmed.dropFirst("Color Depth: ".count)))
+        } else if trimmed.hasPrefix("Scaling: ") {
+            current?.scaling = String(trimmed.dropFirst("Scaling: ".count))
+        } else if trimmed.hasPrefix("Origin: (") {
+            let rest = trimmed.dropFirst("Origin: (".count)
+            if let closeIdx = rest.firstIndex(of: ")") {
+                let coords = rest[..<closeIdx]
+                let parts = coords.split(separator: ",")
+                if parts.count >= 2 {
+                    current?.ox = Int(parts[0].trimmingCharacters(in: .whitespaces))
+                    current?.oy = Int(parts[1].trimmingCharacters(in: .whitespaces))
+                }
+            }
+        } else if trimmed.hasPrefix("Rotation: ") {
+            current?.rot = Int(String(trimmed.dropFirst("Rotation: ".count)))
+        } else if trimmed.hasPrefix("Enabled: ") {
+            current?.enabled = trimmed.dropFirst("Enabled: ".count) == "true"
+        }
+    }
+    if let c = current, let id = c.id, let res = c.res, let ox = c.ox, let oy = c.oy, let rot = c.rot, let hz = c.hz {
+        displays.append(MonitorEntry(
+            id: id, contextual_id: c.cid, serial_id: c.sid, type: c.type,
+            resolution: res, hertz: hz, color_depth: c.depth ?? 8,
+            scaling: c.scaling ?? "off",
+            origin: MonitorOrigin(x: ox, y: oy),
+            rotation: rot, enabled: c.enabled ?? true
+        ))
+    }
+    return displays
+}
+
+// MARK: - Display Layout Restore
+
+func cmdRestoreDisplayLayout() -> Int32 {
+    let store = loadConfigStore()
+    let fingerPrint = displayFingerprint()
+
+    guard let layout = store[fingerPrint]?.monitors, !layout.displays.isEmpty else {
+        fputs("Skipping restore-displays: no saved display layout.\n", stderr)
+        return EXIT_PRECONDITION
+    }
+
+    // Build displayplacer command
+    let parts = layout.displays.map { d -> String in
+        let arg = "id:\(d.id) res:\(d.resolution) hz:\(d.hertz) color_depth:\(d.color_depth) enabled:true scaling:off origin:(\(d.origin.x),\(d.origin.y)) degree:\(d.rotation)"
+        return arg
+    }
+
+    let cmd = "/opt/homebrew/bin/displayplacer " + parts.map { "\"\($0)\"" }.joined(separator: " ")
+    print("Running: \(cmd)")
+
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/bash")
+    p.arguments = ["-c", cmd]
+    do {
+        try p.run()
+    } catch {
+        fputs("Failed to run displayplacer: \(error)\n", stderr)
+        return EXIT_FAILED
+    }
+    p.waitUntilExit()
+
+    if p.terminationStatus == 0 {
+        print("Display layout restored (\(layout.displays.count) displays)")
+    } else {
+        fputs("displayplacer exited with code \(p.terminationStatus)\n", stderr)
+        return EXIT_FAILED
+    }
+
+    return EXIT_OK
+}
+
+// MARK: - Check if display layout changed
+
+func displayLayoutChanged() -> Bool {
+    let store = loadConfigStore()
+    let fp = displayFingerprint()
+    return store[fp]?.monitors != nil
+}
+
 // MARK: - Save All
 
 func runSubCommand(_ args: [String]) -> Int32 {
@@ -93,6 +248,10 @@ func stageResult(_ t0: Date, _ name: String, _ code: Int32) {
 func cmdSaveAll(port: Int) -> Int32 {
     let t0 = Date()
     // In-process orchestration: direct calls, no sub-process re-exec.
+    stageLog(t0, "save-monitors")
+    let mr = cmdSaveDisplayLayout()
+    stageResult(t0, "save-monitors", mr)
+    print("")
     stageLog(t0, "save-layout")
     let lr = cmdSaveLayout(port: port)
     stageResult(t0, "save-layout", lr)
@@ -116,7 +275,7 @@ func cmdSaveAll(port: Int) -> Int32 {
     stageLog(t0, "save-windows")
     let owr = cmdSaveWindows()
     stageResult(t0, "save-windows", owr)
-    let failed = [lr, wr, cr, vr, zr, owr].filter { $0 != EXIT_OK && $0 != EXIT_PRECONDITION }
+    let failed = [mr, lr, wr, cr, vr, zr, owr].filter { $0 != EXIT_OK && $0 != EXIT_PRECONDITION }
     // Precondition-skips don't fail save-all; real failures do.
 
     print("")
@@ -130,6 +289,20 @@ func cmdSaveAll(port: Int) -> Int32 {
 
 func cmdRestoreAll(port: Int) -> Int32 {
     let t0 = Date()
+
+    // 1. Restore monitor layout first
+    stageLog(t0, "restore-monitors")
+    let mr = cmdRestoreDisplayLayout()
+    stageResult(t0, "restore-monitors", mr)
+    print("")
+
+    // 2. If monitors were actually repositioned, wait for elements to settle
+    let wasChanged = (mr == EXIT_OK)
+    if wasChanged {
+        print("[\(nowStamp()) +\(elapsed(t0))] Monitors repositioned, waiting 1s for elements to settle...")
+        Thread.sleep(forTimeInterval: 1.0)
+    }
+
     stageLog(t0, "restore-win")
     let wr = cmdRestoreWin(port: port)
     stageResult(t0, "restore-win", wr)
@@ -158,7 +331,7 @@ func cmdRestoreAll(port: Int) -> Int32 {
     stageLog(t0, "restore-codeserver-layout")
     let cr = cmdRestoreCodeServerLayout(port: CODESERVER_PORT)
     stageResult(t0, "restore-codeserver-layout", cr)
-    let failed = [wr, lr, vr, zr, owr, cr].filter { $0 != EXIT_OK && $0 != EXIT_PRECONDITION }
+    let failed = [mr, wr, lr, vr, zr, owr, cr].filter { $0 != EXIT_OK && $0 != EXIT_PRECONDITION }
 
     print("")
     stageLog(t0, "vivaldi-title-split")

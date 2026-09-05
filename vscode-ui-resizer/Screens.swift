@@ -51,107 +51,66 @@ func edgeDistance(_ p: CGPoint, _ r: NSRect) -> CGFloat {
     return dx * dx + dy * dy
 }
 
-// MARK: - Display Fingerprint (v2: points + scale, v1 legacy alias)
+// MARK: - Display Fingerprint (UUID-based)
 
 func displayFingerprint() -> String {
-    struct DisplayLine {
-        let x: Int
-        let y: Int
-        let wPt: Int
-        let hPt: Int
-        let scale: Double
-        let rot: Int
+    struct DPDisplay {
+        let id: String
+        let cid: Int
         let name: String
-        let isMain: Bool
     }
 
-    let screens = NSScreen.screens
-    var displays: [DisplayLine] = []
-
-    for (idx, screen) in screens.enumerated() {
-        let frame = screen.frame
+    // Build NSScreenNumber → name map from NSScreen
+    var nsNameByID: [Int: String] = [:]
+    for screen in NSScreen.screens {
         let name = screen.localizedName.isEmpty ? "Display" : screen.localizedName
-        let isMain = (idx == 0)
+        if let nsid = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? Int {
+            nsNameByID[nsid] = name
+        }
+    }
 
-        var rotation = 0
-        var scale: Double = Double(screen.backingScaleFactor)
-        if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
-            rotation = Int(CGDisplayRotation(screenNumber))
-            if let mode = CGDisplayCopyDisplayMode(screenNumber), frame.width > 0 {
-                scale = Double(mode.pixelWidth) / Double(frame.width)
+    // Run displayplacer list to get persistent UUIDs + contextual IDs
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/displayplacer")
+    p.arguments = ["list"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    var displays: [DPDisplay] = []
+    do {
+        try p.run()
+        p.waitUntilExit()
+        if p.terminationStatus == 0 {
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            var curId = "", curCid = 0
+            for line in out.components(separatedBy: "\n") {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("Persistent screen id: ") {
+                    if !curId.isEmpty {
+                        let n = nsNameByID[curCid] ?? "Display"
+                        displays.append(DPDisplay(id: curId, cid: curCid, name: n))
+                    }
+                    curId = String(t.dropFirst("Persistent screen id: ".count))
+                    curCid = 0
+                } else if t.hasPrefix("Contextual screen id: ") {
+                    curCid = Int(String(t.dropFirst("Contextual screen id: ".count))) ?? 0
+                }
+            }
+            if !curId.isEmpty {
+                let n = nsNameByID[curCid] ?? "Display"
+                displays.append(DPDisplay(id: curId, cid: curCid, name: n))
             }
         }
-        if scale <= 0 { scale = 1 }
+    } catch {}
 
-        displays.append(DisplayLine(
-            x: Int(frame.origin.x),
-            y: Int(frame.origin.y),
-            wPt: Int(frame.width),
-            hPt: Int(frame.height),
-            scale: scale,
-            rot: rotation,
-            name: name,
-            isMain: isMain
-        ))
-    }
-
-    displays.sort { $0.x < $1.x || ($0.x == $1.x && $0.y < $1.y) }
-
-    return displays.map { d in
-        let xStr = String(format: "%5d", d.x)
-        let yStr = String(format: "%3d", d.y)
-        let marker = d.isMain ? " *" : ""
-        let scaleStr = String(format: "%.2f", d.scale)
-        return "[\(xStr),\(yStr)] \(d.wPt)x\(d.hPt)pt @\(scaleStr)x \(d.rot)°  \(d.name)\(marker)"
-    }.joined(separator: "\n")
-}
-
-func legacyDisplayFingerprint() -> String {
-    // v1 format (points origin + pixel size, no scale) — read-only alias for migration.
-    struct DisplayLine {
-        let x: Int
-        let y: Int
-        let w: Int
-        let h: Int
-        let rot: Int
-        let name: String
-        let isMain: Bool
-    }
-    let screens = NSScreen.screens
-    var displays: [DisplayLine] = []
-    for (idx, screen) in screens.enumerated() {
-        let frame = screen.frame
-        let name = screen.localizedName.isEmpty ? "Display" : screen.localizedName
-        var rotation = 0
-        var physW = Int(frame.width)
-        var physH = Int(frame.height)
-        if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
-            rotation = Int(CGDisplayRotation(screenNumber))
-            if let mode = CGDisplayCopyDisplayMode(screenNumber) {
-                physW = mode.pixelWidth
-                physH = mode.pixelHeight
-            }
-        }
-        if rotation == 90 || rotation == 270 { swap(&physW, &physH) }
-        displays.append(DisplayLine(x: Int(frame.origin.x), y: Int(frame.origin.y), w: physW, h: physH, rot: rotation, name: name, isMain: idx == 0))
-    }
-    displays.sort { $0.x < $1.x || ($0.x == $1.x && $0.y < $1.y) }
-    return displays.map { d in
-        let xStr = String(format: "%5d", d.x)
-        let yStr = String(format: "%3d", d.y)
-        let marker = d.isMain ? "*" : " "
-        return "[\(xStr),\(yStr)] \(d.w)x\(d.h) \(d.rot)°  \(d.name)\(marker)"
-    }.joined(separator: "\n")
+    // Sort by UUID (alphabetically = stable order)
+    displays.sort { $0.id < $1.id }
+    return displays.map { "\($0.name) - \($0.id.prefix(8))..." }.joined(separator: "\n")
 }
 
 func lookupDisplayEntry(in store: [String: DisplayConfig]) -> (key: String, entry: DisplayConfig, source: String)? {
     let fp = displayFingerprint()
     if let e = store[fp] { return (fp, e, "matched") }
-    let legacy = legacyDisplayFingerprint()
-    if legacy != fp, let e = store[legacy] {
-        fputs("Using legacy display fingerprint; re-save to migrate to v2.\n", stderr)
-        return (legacy, e, "legacy")
-    }
     if store.count == 1, let (k, v) = store.first {
         fputs("No saved config for current display layout; using the only available saved config.\n", stderr)
         print("\nCurrent layout:\n\(fp)\n")

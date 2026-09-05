@@ -2,8 +2,9 @@
 
 vscode-ui-resizer: vscode-ui-resizer/vscode-ui-resizer.exe
 
-vscode-ui-resizer/vscode-ui-resizer.exe: vscode-ui-resizer/*.swift
-	swiftc -o vscode-ui-resizer/vscode-ui-resizer.exe vscode-ui-resizer/*.swift
+vscode-ui-resizer/vscode-ui-resizer.exe: vscode-ui-resizer/Package.swift vscode-ui-resizer/*.swift
+	cd vscode-ui-resizer && swift build -c release --disable-sandbox
+	cp .build/release/vscode-ui-resizer vscode-ui-resizer.exe
 	@echo "Built vscode-ui-resizer/vscode-ui-resizer.exe"
 
 clean:
