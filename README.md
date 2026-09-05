@@ -39,7 +39,7 @@ Exit codes: `0` ok, `1` failed, `2` precondition (AX denied / CDP unreachable / 
 
 ## Config
 
-Single **YAML** store at `~/.config/vscode-cdp-automator/config.yaml`, keyed by a multi-line fingerprint of sorted persistent monitor UUIDs (`Name - UUID...`). Each entry keeps:
+Single **YAML** store at `~/.config/vscode-cdp-automator/config.yaml`, keyed by a multi-line fingerprint of sorted persistent monitor UUIDs (`Name - UUID...`). Monitor layout rules are defined separately in `vscode-ui-resizer/monitor-rules.yaml` (see [Monitor Rules](#monitor-rules)). Each fingerprint entry keeps:
 
 | Key | Content |
 |-----|---------|
@@ -59,6 +59,32 @@ Old JSON config (`config.json`) is auto-migrated to YAML on first read. Legacy c
 - **Zoom** — VS Code: backup + JSONC-tolerant edit of `settings.json` `window.zoomLevel` (validates before/after, restores backup on failure); Vivaldi: `window.vivaldi.zoom` + `chrome.tabs.setZoom` over `window.html` target.
 - **Other windows** — every running `.regular` GUI app (excluding VS Code + Vivaldi) has its windows enumerated via `AXWindows`, keyed by `bundleIdentifier` and stored positionally. Restore is title-first with positional fallback. Restore only positions windows of apps already running; absent apps log a warning and are skipped (never launched).
 - **Eligibility gating** — windows are skipped unless sidebar-left / panel-right / not-maximized, so orthogonal layouts are never clobbered.
+- **Monitor rules** — `restore-monitors` can fall back to a declarative rule when no saved snapshot exists for the current display fingerprint (see [Monitor Rules](#monitor-rules)).
+
+### Monitor Rules
+
+Defined in `vscode-ui-resizer/monitor-rules.yaml` (loaded from disk at runtime, alongside the repo). Falls back to `builtinMonitorPresets` in `ConfigStore.swift` if the file is not found. Evaluated in declaration order on every `restore-monitors` that has no matching snapshot; first match wins.
+
+```yaml
+- name: eink-row
+  match:
+    all_of:
+      - 12DF9D18-D36A-4B71-B782-384E1AA1DDA7
+      - CA80224C-2647-4420-8DC2-2CC0F710BC17
+      - 4E09C07E-CA1F-461A-B1A8-EDC759F564CE
+  layout:
+    type: row
+    origin: { x: -1080, y: 0 }
+    members:
+      - { id: 12DF9D18-…, rotation: 90,  width: 1080 }
+      - { id: CA80224C-…, rotation: 90,  width: 1080 }
+      - { id: 4E09C07E-…, rotation: 270, width: 1080 }
+```
+
+- **match.all_of** — persistent UUIDs that must all be connected for the rule to fire. Partial matches are skipped.
+- **layout.type** — currently only `row`. Members are placed left-to-right: member `i` gets `x = origin.x + Σ(width[0..i-1])`, `y = origin.y`.
+- Non-matched monitors keep their current macOS positions (only rule members are repositioned).
+- After a rule fires, run `save-monitors` to capture the full arrangement for future use. Once a snapshot exists for the current fingerprint, the rule is not re-evaluated.
 
 ## Tools
 

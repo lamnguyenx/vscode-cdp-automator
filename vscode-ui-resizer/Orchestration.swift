@@ -109,21 +109,53 @@ func parseDisplayplacerList(_ text: String) -> [MonitorEntry] {
 
 // MARK: - Display Layout Restore
 
-func cmdRestoreDisplayLayout() -> Int32 {
-    let store = loadConfigStore()
-    let fingerPrint = displayFingerprint()
-
-    guard let layout = store[fingerPrint]?.monitors, !layout.displays.isEmpty else {
-        fputs("Skipping restore-displays: no saved display layout.\n", stderr)
-        return EXIT_PRECONDITION
+func readCurrentDisplays() -> [MonitorEntry] {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/displayplacer")
+    p.arguments = ["list"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do {
+        try p.run()
+        p.waitUntilExit()
+    } catch {
+        return []
     }
+    guard p.terminationStatus == 0 else { return [] }
+    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return parseDisplayplacerList(out)
+}
 
-    // Build displayplacer command
-    let parts = layout.displays.map { d -> String in
-        let arg = "id:\(d.id) res:\(d.resolution) hz:\(d.hertz) color_depth:\(d.color_depth) enabled:true scaling:off origin:(\(d.origin.x),\(d.origin.y)) degree:\(d.rotation)"
-        return arg
+func applyRule(_ rule: MonitorRule, to current: [MonitorEntry]) -> [MonitorEntry] {
+    var xCursor = rule.layout.origin.x
+    var overrides: [String: (x: Int, y: Int, rotation: Int)] = [:]
+    for member in rule.layout.members {
+        overrides[member.id] = (x: xCursor, y: rule.layout.origin.y, rotation: member.rotation)
+        xCursor += member.width
     }
+    return current.map { entry in
+        guard let ov = overrides[entry.id] else { return entry }
+        return MonitorEntry(
+            id: entry.id,
+            contextual_id: entry.contextual_id,
+            serial_id: entry.serial_id,
+            type: entry.type,
+            resolution: entry.resolution,
+            hertz: entry.hertz,
+            color_depth: entry.color_depth,
+            scaling: entry.scaling,
+            origin: MonitorOrigin(x: ov.x, y: ov.y),
+            rotation: ov.rotation,
+            enabled: entry.enabled
+        )
+    }
+}
 
+func runDisplayplacer(_ displays: [MonitorEntry]) -> Int32 {
+    let parts = displays.map { d -> String in
+        "id:\(d.id) res:\(d.resolution) hz:\(d.hertz) color_depth:\(d.color_depth) enabled:true scaling:off origin:(\(d.origin.x),\(d.origin.y)) degree:\(d.rotation)"
+    }
     let cmd = "/opt/homebrew/bin/displayplacer " + parts.map { "\"\($0)\"" }.joined(separator: " ")
     print("Running: \(cmd)")
 
@@ -139,13 +171,49 @@ func cmdRestoreDisplayLayout() -> Int32 {
     p.waitUntilExit()
 
     if p.terminationStatus == 0 {
-        print("Display layout restored (\(layout.displays.count) displays)")
+        print("Display layout restored (\(displays.count) displays)")
     } else {
         fputs("displayplacer exited with code \(p.terminationStatus)\n", stderr)
         return EXIT_FAILED
     }
-
     return EXIT_OK
+}
+
+func cmdRestoreDisplayLayout() -> Int32 {
+    let store = loadConfigStore()
+    let fingerPrint = displayFingerprint()
+
+    // Path 1: saved snapshot exists → use it
+    if let layout = store[fingerPrint]?.monitors, !layout.displays.isEmpty {
+        return runDisplayplacer(layout.displays)
+    }
+
+    // Path 2: no snapshot → try rules
+    let current = readCurrentDisplays()
+    guard !current.isEmpty else {
+        fputs("Cannot read current displays.\n", stderr)
+        return EXIT_FAILED
+    }
+    let currentIds = Set(current.map { $0.id })
+    let rules = loadConfigRules()
+    for rule in rules {
+        let required = Set(rule.match.all_of)
+        guard required.isSubset(of: currentIds) else { continue }
+
+        let n = required.count
+        print("No snapshot for current display layout; rule '\(rule.name ?? "(unnamed)")' matched (\(n)/\(n) UUIDs present). Applying rule layout.")
+        if verboseLogging {
+            for m in rule.layout.members {
+                print("  \(m.id.prefix(8))... → rot \(m.rotation)° at slot width=\(m.width)")
+            }
+        }
+
+        let target = applyRule(rule, to: current)
+        return runDisplayplacer(target)
+    }
+
+    fputs("Skipping restore-displays: no saved display layout and no matching rule.\n", stderr)
+    return EXIT_PRECONDITION
 }
 
 // MARK: - Check if display layout changed

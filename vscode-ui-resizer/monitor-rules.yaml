@@ -1,0 +1,13 @@
+- name: eink-row
+  match:
+    all_of:
+      - 12DF9D18-D36A-4B71-B782-384E1AA1DDA7
+      - CA80224C-2647-4420-8DC2-2CC0F710BC17
+      - 4E09C07E-CA1F-461A-B1A8-EDC759F564CE
+  layout:
+    type: row
+    origin: { x: -1080, y: 0 }
+    members:
+      - { id: 12DF9D18-D36A-4B71-B782-384E1AA1DDA7, rotation: 90,  width: 1080 }
+      - { id: CA80224C-2647-4420-8DC2-2CC0F710BC17, rotation: 90,  width: 1080 }
+      - { id: 4E09C07E-CA1F-461A-B1A8-EDC759F564CE, rotation: 270, width: 1080 }

@@ -16,6 +16,7 @@ let VIVALDI_BUNDLE_ID = "com.vivaldi.Vivaldi"
 
 let CONFIG_PATH = NSString(string: "~/.config/vscode-cdp-automator/config.yaml").expandingTildeInPath
 let LEGACY_JSON_CONFIG_PATH = NSString(string: "~/.config/vscode-cdp-automator/config.json").expandingTildeInPath
+let MONITOR_RULES_FILENAME = "monitor-rules.yaml"
 let LEGACY_WIN_CONFIG_PATH = NSString(string: "~/.config/vscode/windows.json").expandingTildeInPath
 let LEGACY_LAYOUT_CONFIG_PATH = NSString(string: "~/.config/vscode/panel-and-bar-sides.json").expandingTildeInPath
 let USER_SETTINGS_PATH = NSString(string: "~/Library/Application Support/Code/User/settings.json").expandingTildeInPath
@@ -94,6 +95,50 @@ struct MonitorOrigin: Codable {
 struct DisplayLayout: Codable {
     let displays: [MonitorEntry]
 }
+
+// MARK: - Monitor Rules
+
+struct MonitorRule: Codable {
+    var name: String?
+    var match: MonitorRuleMatch
+    var layout: MonitorRuleLayout
+}
+
+struct MonitorRuleMatch: Codable {
+    var all_of: [String]
+}
+
+struct MonitorRuleLayout: Codable {
+    var type: String
+    var origin: MonitorOrigin
+    var members: [MonitorRuleMember]
+}
+
+struct MonitorRuleMember: Codable {
+    var id: String
+    var rotation: Int
+    var width: Int
+}
+
+let builtinMonitorPresets: [MonitorRule] = [
+    MonitorRule(
+        name: "eink-row",
+        match: MonitorRuleMatch(all_of: [
+            "12DF9D18-D36A-4B71-B782-384E1AA1DDA7",
+            "CA80224C-2647-4420-8DC2-2CC0F710BC17",
+            "4E09C07E-CA1F-461A-B1A8-EDC759F564CE",
+        ]),
+        layout: MonitorRuleLayout(
+            type: "row",
+            origin: MonitorOrigin(x: -1080, y: 0),
+            members: [
+                MonitorRuleMember(id: "12DF9D18-D36A-4B71-B782-384E1AA1DDA7", rotation: 90,  width: 1080),
+                MonitorRuleMember(id: "CA80224C-2647-4420-8DC2-2CC0F710BC17", rotation: 90,  width: 1080),
+                MonitorRuleMember(id: "4E09C07E-CA1F-461A-B1A8-EDC759F564CE", rotation: 270, width: 1080),
+            ]
+        )
+    )
+]
 
 struct DisplayConfig: Codable {
     var window: WindowInfo? = nil
@@ -189,11 +234,36 @@ func loadConfigStore() -> [String: DisplayConfig] {
 }
 
 func pruneOldFingerprintKeys(_ store: [String: DisplayConfig]) -> [String: DisplayConfig] {
-    // New keys contain a UUID fragment after " - " or starting with hex
     let hasNewKey = store.keys.contains { $0.contains(" - ") || $0.range(of: "^[0-9A-F]{8}\\.\\.\\.", options: .regularExpression) != nil }
     if !hasNewKey { return store }
-    // Keep only keys that look like new fingerprints
     return store.filter { $0.key.contains(" - ") || $0.key.range(of: "^[0-9A-F]{8}\\.\\.\\.", options: .regularExpression) != nil }
+}
+
+func findRulesFile() -> String? {
+    let fm = FileManager.default
+    let exeURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    let exeDir = exeURL.deletingLastPathComponent()
+    var candidates: [String] = [
+        exeDir.path,
+        exeDir.deletingLastPathComponent().path,
+    ]
+    if let gr = gitRoot() { candidates.append(gr) }
+    candidates.append(fm.currentDirectoryPath)
+    for c in candidates {
+        let full = c + "/\(MONITOR_RULES_FILENAME)"
+        if fm.fileExists(atPath: full) { return full }
+    }
+    return nil
+}
+
+func loadConfigRules() -> [MonitorRule] {
+    if let path = findRulesFile(),
+       let data = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8),
+       let rules = try? YAMLDecoder().decode([MonitorRule].self, from: data),
+       !rules.isEmpty {
+        return rules
+    }
+    return builtinMonitorPresets
 }
 
 func saveConfigStore(_ store: [String: DisplayConfig]) -> Bool {

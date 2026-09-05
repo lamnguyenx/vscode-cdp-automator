@@ -12,7 +12,7 @@ let package = Package(
             name: "vscode-ui-resizer",
             dependencies: ["Yams"],
             path: ".",
-            exclude: ["Package.swift", "vscode-ui-resizer.exe"],
+            exclude: ["Package.swift", "vscode-ui-resizer.exe", "monitor-rules.yaml"],
             swiftSettings: [
                 .unsafeFlags(["-Xfrontend", "-disable-actor-data-race-checks"])
             ]
