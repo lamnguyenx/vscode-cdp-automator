@@ -51,61 +51,13 @@ func edgeDistance(_ p: CGPoint, _ r: NSRect) -> CGFloat {
     return dx * dx + dy * dy
 }
 
-// MARK: - Display Fingerprint (UUID-based)
+// MARK: - Display Fingerprint (name-based, stable across UUID rotation)
 
 func displayFingerprint() -> String {
-    struct DPDisplay {
-        let id: String
-        let cid: Int
-        let name: String
-    }
-
-    // Build NSScreenNumber → name map from NSScreen
-    var nsNameByID: [Int: String] = [:]
-    for screen in NSScreen.screens {
-        let name = screen.localizedName.isEmpty ? "Display" : screen.localizedName
-        if let nsid = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? Int {
-            nsNameByID[nsid] = name
-        }
-    }
-
-    // Run displayplacer list to get persistent UUIDs + contextual IDs
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/displayplacer")
-    p.arguments = ["list"]
-    let pipe = Pipe()
-    p.standardOutput = pipe
-    p.standardError = FileHandle.nullDevice
-    var displays: [DPDisplay] = []
-    do {
-        try p.run()
-        p.waitUntilExit()
-        if p.terminationStatus == 0 {
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            var curId = "", curCid = 0
-            for line in out.components(separatedBy: "\n") {
-                let t = line.trimmingCharacters(in: .whitespaces)
-                if t.hasPrefix("Persistent screen id: ") {
-                    if !curId.isEmpty {
-                        let n = nsNameByID[curCid] ?? "Display"
-                        displays.append(DPDisplay(id: curId, cid: curCid, name: n))
-                    }
-                    curId = String(t.dropFirst("Persistent screen id: ".count))
-                    curCid = 0
-                } else if t.hasPrefix("Contextual screen id: ") {
-                    curCid = Int(String(t.dropFirst("Contextual screen id: ".count))) ?? 0
-                }
-            }
-            if !curId.isEmpty {
-                let n = nsNameByID[curCid] ?? "Display"
-                displays.append(DPDisplay(id: curId, cid: curCid, name: n))
-            }
-        }
-    } catch {}
-
-    // Sort by UUID (alphabetically = stable order)
-    displays.sort { $0.id < $1.id }
-    return displays.map { "\($0.name) - \($0.id.prefix(8))..." }.joined(separator: "\n")
+    let names = NSScreen.screens
+        .map { $0.localizedName.isEmpty ? "Display" : $0.localizedName }
+        .sorted()
+    return names.joined(separator: "\n")
 }
 
 func lookupDisplayEntry(in store: [String: DisplayConfig]) -> (key: String, entry: DisplayConfig, source: String)? {

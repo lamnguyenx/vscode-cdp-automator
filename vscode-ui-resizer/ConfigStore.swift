@@ -187,23 +187,55 @@ func migrateOldJSON() {
     }
 }
 
+func migrateOldFingerprintKeys(_ store: inout [String: DisplayConfig]) {
+    let fp = displayFingerprint()
+    if store[fp] != nil { return }
+    let fpNames = Set(fp.components(separatedBy: "\n"))
+    for (key, entry) in store {
+        let oldLines = key.components(separatedBy: "\n")
+        let compacted = oldLines.compactMap { line -> String? in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return nil }
+            let parts = trimmed.components(separatedBy: " - ")
+            return parts[0].trimmingCharacters(in: .whitespaces)
+        }
+        let oldNames = Set(compacted)
+        if oldNames == fpNames {
+            fputs("Migrating old fingerprint key → new name-only key\n", stderr)
+            if verboseLogging {
+                fputs("  old: \(key.prefix(80))...\n", stderr)
+                fputs("  new:\n\(fp)\n", stderr)
+            }
+            store[fp] = entry
+            store.removeValue(forKey: key)
+            _ = saveConfigStore(store)
+            return
+        }
+    }
+}
+
 func loadConfigStore() -> [String: DisplayConfig] {
     migrateOldJSON()
+
+    var store: [String: DisplayConfig] = [:]
 
     if FileManager.default.fileExists(atPath: CONFIG_PATH) {
         do {
             let data = try String(contentsOf: URL(fileURLWithPath: CONFIG_PATH), encoding: .utf8)
-            let store = try YAMLDecoder().decode([String: DisplayConfig].self, from: data)
-            return pruneOldFingerprintKeys(store)
+            store = try YAMLDecoder().decode([String: DisplayConfig].self, from: data)
         } catch {
             fputs("Config at \(CONFIG_PATH) is corrupt (\(error)); leaving untouched, using empty store.\n", stderr)
-            return pruneOldFingerprintKeys([:])
+            return store
         }
     }
 
-    var store: [String: DisplayConfig] = [:]
+    migrateOldFingerprintKeys(&store)
+    if !store.isEmpty {
+        _ = saveConfigStore(store)
+        return store
+    }
 
-    // Migrate legacy configs into the current fingerprint key
+    // No YAML or empty — try legacy configs
     let fp = displayFingerprint()
     var entry = DisplayConfig()
 
@@ -231,12 +263,6 @@ func loadConfigStore() -> [String: DisplayConfig] {
     }
 
     return store
-}
-
-func pruneOldFingerprintKeys(_ store: [String: DisplayConfig]) -> [String: DisplayConfig] {
-    let hasNewKey = store.keys.contains { $0.contains(" - ") || $0.range(of: "^[0-9A-F]{8}\\.\\.\\.", options: .regularExpression) != nil }
-    if !hasNewKey { return store }
-    return store.filter { $0.key.contains(" - ") || $0.key.range(of: "^[0-9A-F]{8}\\.\\.\\.", options: .regularExpression) != nil }
 }
 
 func findRulesFile() -> String? {

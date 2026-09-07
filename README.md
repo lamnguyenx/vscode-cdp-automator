@@ -39,7 +39,7 @@ Exit codes: `0` ok, `1` failed, `2` precondition (AX denied / CDP unreachable / 
 
 ## Config
 
-Single **YAML** store at `~/.config/vscode-cdp-automator/config.yaml`, keyed by a multi-line fingerprint of sorted persistent monitor UUIDs (`Name - UUID...`). Monitor layout rules are defined separately in `vscode-ui-resizer/monitor-rules.yaml` (see [Monitor Rules](#monitor-rules)). Each fingerprint entry keeps:
+Single **YAML** store at `~/.config/vscode-cdp-automator/config.yaml`, keyed by a multi-line fingerprint of sorted monitor names (see [how macOS assigns monitor names](docs/important/how-macos-assign-monitor-names.md)). Monitor layout rules are defined separately in `vscode-ui-resizer/monitor-rules.yaml` (see [Monitor Rules](#monitor-rules)). Each fingerprint entry keeps:
 
 | Key | Content |
 |-----|---------|
@@ -168,5 +168,5 @@ VS Code / Electron / Vivaldi must be started with `--remote-debugging-port=<port
 
 Field notes and implementation logs live under `docs/`:
 
-- `docs/important/` — durable references: Vivaldi CDP/prefs quirks, zoom APIs, tab-bar resize mechanics, tab-strip customization.
+- `docs/important/` — durable references: Vivaldi CDP/prefs quirks, zoom APIs, tab-bar resize mechanics, tab-strip customization, [monitor name assignment](docs/important/how-macos-assign-monitor-names.md).
 - `docs/lessons/`, `docs/plans/`, `docs/issues/bugs/` — dated writeups, e.g. [2026-09-04 restore window geometry round-trip](docs/issues/bugs/2026/09/04/2026-09-04-restore-window-geometry-roundtrip-CLOSED.md) (off-screen misclassification, matched-screen clamping, maximized break-fill + stepped resize).
