@@ -115,7 +115,7 @@ const apply = async (t) => {
     console.log(`${t.id.slice(0, 8)}: off`);
   } else {
     const savedPos = readBtnPos();
-    await ev(`(() => {
+    await ev(`(async () => {
       const SAVED_POS = ${JSON.stringify(savedPos)};
       const old = document.getElementById('tab-title-split');
       if (old) old.remove();
@@ -127,11 +127,34 @@ const apply = async (t) => {
       const GAP_INNER = ${GAP};
       const strip = document.querySelector('.tab-strip');
       const resize = strip?.parentElement;
+      // Group tabs by URL origin (host[:port]). chrome.tabs is available in
+      // window.html's privileged context and returns each tab's {title,url}.
+      // The DOM .tab element no longer carries the tab id in current Vivaldi,
+      // so we match DOM titles → tab records by title. Refreshed every run so
+      // navigation / new tabs are picked up. Fallback: the old title split, so
+      // a missing/empty chrome.tabs result never breaks the layout.
+      let titleToGroup = new Map();
+      const refreshGroups = async () => {
+        titleToGroup = new Map();
+        if (typeof chrome === 'undefined' || !chrome.tabs) return;
+        const ts = await new Promise(res => {
+          try { chrome.tabs.query({ currentWindow: true }, r => res(Array.isArray(r) ? r : [])); }
+          catch (e) { res([]); }
+        });
+        for (const tb of ts) {
+          let g;
+          try { const u = new URL(tb.url || ''); g = u.host || u.protocol; }
+          catch (e) { g = tb.url ? ('raw:' + tb.url.slice(0, 48)) : 'other'; }
+          titleToGroup.set(tb.title, g);
+        }
+      };
       const getGroup = (txt) => {
         if (!txt || txt.trim() === 'Blank Page') return 'blank';
+        if (titleToGroup.has(txt)) return titleToGroup.get(txt);
         return txt.split(' - ')[0].trim();
       };
-      const applyTabSplit = () => {
+      const applyTabSplit = async () => {
+        await refreshGroups();
         const positions = [...document.querySelectorAll('.tab-strip .tab-position')];
         positions.forEach(p => p.classList.remove('tab-group-end'));
         let offset = 0;
@@ -184,7 +207,7 @@ const apply = async (t) => {
           resize.style.setProperty('max-height', (n * (NEW_H_INNER + 1) + totalGaps * GAP_INNER) + 'px');
         }
       };
-      applyTabSplit();
+      await applyTabSplit();
       // inject refresh button — remove any stale one (may carry old handlers)
       const oldBtn = document.getElementById('tab-split-refresh-btn');
       if (oldBtn) oldBtn.remove();
