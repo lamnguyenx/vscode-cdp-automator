@@ -364,6 +364,20 @@ const flashArgs = async (ev, PORT, args, host = null, os = null, persist = false
       'border:1px solid rgba(255,255,255,0.18);border-radius:13px;padding:16px 22px 0;' +
       'min-width:176px;max-width:' + MAXW + 'px;box-shadow:0 10px 38px rgba(0,0,0,0.65);' +
       'backdrop-filter:blur(8px);overflow:hidden;transition:opacity .45s ease;opacity:0;';
+    const closeBtn = document.createElement('div');
+    closeBtn.textContent = '\\u00d7';
+    closeBtn.style.cssText = 'position:absolute;top:8px;right:8px;width:32px;height:32px;' +
+      'line-height:30px;text-align:center;font-size:26px;cursor:pointer;color:#fff;opacity:.6;' +
+      'transition:opacity .15s,background .15s,transform .15s;border-radius:50%;user-select:none;' +
+      'font-family:system-ui,-apple-system,sans-serif;padding:0;margin:0;border:0;' +
+      'background:rgba(255,255,255,0.1);';
+    closeBtn.title = 'close';
+    closeBtn.onmouseenter = () => { closeBtn.style.opacity = '1'; closeBtn.style.background = 'rgba(255,255,255,0.22)'; closeBtn.style.transform = 'scale(1.08)'; };
+    closeBtn.onmouseleave = () => { closeBtn.style.opacity = '.6'; closeBtn.style.background = 'rgba(255,255,255,0.1)'; closeBtn.style.transform = 'scale(1)'; };
+    closeBtn.onmousedown = (e) => { e.stopPropagation(); closeBtn.style.background = 'rgba(255,255,255,0.34)'; closeBtn.style.transform = 'scale(0.95)'; };
+    closeBtn.onmouseup = () => { closeBtn.style.background = 'rgba(255,255,255,0.22)'; closeBtn.style.transform = 'scale(1.08)'; };
+    closeBtn.onclick = (e) => { e.stopPropagation(); box.remove(); };
+    box.appendChild(closeBtn);
     const meta = document.createElement('div');
     meta.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:2px;';
     if (HOST) {
