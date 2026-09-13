@@ -1,6 +1,6 @@
 # vscode-cdp-automator
 
-Save and restore **window geometry** and **internal UI layout** for VS Code, code-server tabs, and Vivaldi — keyed per display arrangement. macOS-only (uses Accessibility API + Chrome DevTools Protocol).
+Save and restore **window geometry**, **internal UI layout**, and **zoom** for VS Code, code-server tabs, and Vivaldi — keyed per display arrangement **and per browser+CDP port**. macOS-only (uses Accessibility API + Chrome DevTools Protocol).
 
 ## Build
 
@@ -12,7 +12,7 @@ Produces `vscode-ui-resizer/vscode-ui-resizer.exe`.
 
 ## Usage
 
-Default CDP ports: **9333** for VS Code, **9222** for code-server / Vivaldi.
+Default CDP ports: **9333** for VS Code, **9222** for code-server / Vivaldi. Any Chromium browser started with `--remote-debugging-port=<port>` can be targeted individually:
 
 ```
 vscode-ui-resizer.exe save-win                        Save all open VS Code windows pos & size (title-matched on restore)
@@ -20,7 +20,7 @@ vscode-ui-resizer.exe restore-win [port]              Apply to all VS Code windo
 vscode-ui-resizer.exe save-layout [port]              Save sidebar/panel widths + zoom
 vscode-ui-resizer.exe restore-layout [port]           Restore to all VS Code windows
 vscode-ui-resizer.exe save-codeserver-layout [port]   Save active code-server tab layout
-vscode-ui-resizer.exe restore-codeserver-layout [port] Restore to all code-server tabs
+vscode-ui-resizer.exe restore-codeserver-layout [port] Restore layout + zoom to all code-server tabs
 vscode-ui-resizer.exe save-vivaldi [port]             Save Vivaldi window + vertical tab bar
 vscode-ui-resizer.exe restore-vivaldi [port]          Restore Vivaldi window + tab bar
 vscode-ui-resizer.exe save-vivaldi-zoom [port]        Save Vivaldi UI + default page zoom
@@ -35,28 +35,40 @@ vscode-ui-resizer.exe restore-all [port]              Restore monitors first (1s
 vscode-ui-resizer.exe list-displays                   Print connected screens
 ```
 
+Each `[port]` creates separate config entries keyed by `bundleID-cdp_<port>`. This lets you manage multiple browser instances independently (Vivaldi stable on 9222, Vivaldi Snapshot on 9221, a dedicated automation instance on 9223, Chrome, etc.). The bundle ID is auto-detected from the process listening on the port.
+
 Exit codes: `0` ok, `1` failed, `2` precondition (AX denied / CDP unreachable / no saved data). `save-all` / `restore-all` report per-stage `OK/FAILED/SKIPPED` and fail only on real failures (skips don't fail). All commands accept `--verbose` for AX/CDP diagnostics.
 
 ## Config
 
-Single **YAML** store at `~/.config/vscode-cdp-automator/config.yaml`, keyed by a multi-line fingerprint of sorted monitor names (see [how macOS assigns monitor names](docs/important/how-macos-assign-monitor-names.md)). Monitor layout rules are defined separately in `vscode-ui-resizer/monitor-rules.yaml` (see [Monitor Rules](#monitor-rules)). Each fingerprint entry keeps:
+Two key spaces in `~/.config/vscode-cdp-automator/config.yaml`:
+
+**Display-fingerprint keys** — multi-line string of sorted monitor names, holds display-dependent data:
 
 | Key | Content |
 |-----|---------|
 | `monitors` | Display specs (position, rotation, resolution) for `displayplacer`-based physical layout restore |
 | `layout` | VS Code sidebar/panel/editor sizes, positions, zoom |
 | `windows` | All VS Code window geometries (title-matched on restore) |
-| `vivaldi` | Vivaldi window geometry + vertical tab bar width |
 | `otherWindows` | `bundleID → [window]` map for every other GUI app |
 
-Old JSON config (`config.json`) is auto-migrated to YAML on first read. Legacy configs under `~/.config/vscode/` are also migrated. Old positional fingerprint keys are pruned automatically after migration — run `save-all` once after upgrading to re-capture all data under the new UUID key.
+**Browser+port keys** — `bundleID-cdp_<port>` per running Chromium instance, holds browser-specific data:
+
+| Key | Content |
+|-----|---------|
+| `vivaldi` | Vivaldi window geometry + vertical tab bar width + UI / default zoom |
+| `codeServerLayout` | code-server tab layout (sidebar/panel/editor sizes + zoom level) |
+
+The port identifies the browser via `lsof` to find the PID, then resolves its bundle identifier via `NSWorkspace`. This lets you manage separate profiles on different ports (e.g. `com.vivaldi.Vivaldi-cdp_9222` for stable, `com.vivaldi.Vivaldi.snapshot-cdp_9221` for snapshot, `com.vivaldi.Vivaldi-cdp_9223` for a dedicated automation instance).
+
+Old JSON config (`config.json`) is auto-migrated to YAML on first read. Legacy configs under `~/.config/vscode/` are also migrated. Old display-fingerprint entries that contained `vivaldi` or `codeServerLayout` data are automatically migrated to port-keyed entries on first read (extracted into `com.vivaldi.Vivaldi-cdp_9222`).
 
 ## How it works
 
 - **Window position/size** — macOS Accessibility API (`AXPosition` / `AXSize`), verified by read-back at 3px tolerance (sets report success even when silently dropped, and width/height can fail independently). Save classifies the display size-aware: exact top-left hit → largest window-rect overlap → nearest screen, so edge-sitting windows are never stored `off-screen` while displays exist. Restore trusts fingerprint-matched coordinates within 60px (clamping into the *matched* screen, never main), and `applyWindowGeometry` breaks display-fill/maximized state with one large height change before walking size in ≤400px steps — large single jumps are silently ignored, so spanning restores converge instead of sticking on one display. Requires Accessibility permission (exit 2 with hint otherwise). See [2026-09-04 restore geometry round-trip bug](docs/issues/bugs/2026/09/04/2026-09-04-restore-window-geometry-roundtrip-CLOSED.md).
 - **VS Code sidebar/panel widths** — CDP `Runtime.evaluate` discovery of Monaco sash indices, then synthetic `MouseEvent` `mousedown → mousemove → mouseup` on `window` (VS Code sashes listen for plain MouseEvents). Sash-mapping misses abort instead of guessing indices.
 - **Vivaldi tab bar** — CDP `Input.dispatchMouseEvent` (trusted input), because Vivaldi's resize handle calls `setPointerCapture` and rejects synthetic events.
-- **Zoom** — VS Code: backup + JSONC-tolerant edit of `settings.json` `window.zoomLevel` (validates before/after, restores backup on failure); Vivaldi: `window.vivaldi.zoom` + `chrome.tabs.setZoom` over `window.html` target.
+- **Zoom** — VS Code: backup + JSONC-tolerant edit of `settings.json` `window.zoomLevel` (validates before/after, restores backup on failure); Vivaldi: `window.vivaldi.zoom` + `chrome.tabs.setZoom` over `window.html` target; **code-server**: `Cmd+=`/`Cmd+-` keyboard shortcuts dispatched via `KeyboardEvent` to each tab (parallelized — hibernated tabs timeout independently without blocking others).
 - **Other windows** — every running `.regular` GUI app (excluding VS Code + Vivaldi) has its windows enumerated via `AXWindows`, keyed by `bundleIdentifier` and stored positionally. Restore is title-first with positional fallback. Restore only positions windows of apps already running; absent apps log a warning and are skipped (never launched).
 - **Eligibility gating** — windows are skipped unless sidebar-left / panel-right / not-maximized, so orthogonal layouts are never clobbered.
 - **Monitor rules** — `restore-monitors` can fall back to a declarative rule when no saved snapshot exists for the current display fingerprint (see [Monitor Rules](#monitor-rules)).
@@ -162,7 +174,29 @@ See `docs/plans/2026/08/22/2026-08-22-vivaldi-tab-strip-height-title-split.md` f
 
 ## Launching targets with CDP
 
-VS Code / Electron / Vivaldi must be started with `--remote-debugging-port=<port>`. The port must match what you pass to the commands above.
+Each Chromium instance must be started with `--remote-debugging-port=<port>`. To run multiple independent browser instances (different profiles, different ports):
+
+```bash
+# Vivaldi stable
+/Applications/Vivaldi.app/Contents/MacOS/Vivaldi \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/path/to/profile-1
+
+# Vivaldi Snapshot
+"/Applications/Vivaldi Snapshot.app/Contents/MacOS/Vivaldi Snapshot" \
+  --remote-debugging-port=9221 \
+  --user-data-dir=/path/to/profile-2
+
+# Dedicated automation instance
+/Applications/Vivaldi.app/Contents/MacOS/Vivaldi \
+  --remote-debugging-port=9223 \
+  --user-data-dir=/path/to/profile-3 \
+  --ignore-certificate-errors
+```
+
+VS Code (Electron) also accepts `--remote-debugging-port=<port>`. Pass the same port to the commands above — save/restore will key all data under `bundleID-cdp_<port>`.
+
+Tooling: `tools/show-cdp-ports.mjs` discovers running Chromium instances with `--remote-debugging-port` and their profiles.
 
 ## Docs
 

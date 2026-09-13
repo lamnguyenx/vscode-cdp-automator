@@ -225,14 +225,16 @@ func devHostCommandMap() -> [pid_t: String] {
     task.standardError = FileHandle.nullDevice
     do {
         try task.run()
-        task.waitUntilExit()
     } catch {
         fputs("Warning: could not run /bin/ps for dev-host detection: \(error)\n", stderr)
         devHostCommandCache = map
         devHostCommandCachePopulated = true
         return map
     }
+    // Drain the pipe before waiting: `ps -ax` can exceed the pipe buffer,
+    // and the child blocks on write if we waitUntilExit() first (deadlock).
     let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+    task.waitUntilExit()
     let output = String(data: outputData, encoding: .utf8) ?? ""
     for line in output.split(separator: "\n") {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -261,11 +263,11 @@ func isDevHostProcess(pid: pid_t) -> Bool {
     task.standardError = FileHandle.nullDevice
     do {
         try task.run()
-        task.waitUntilExit()
     } catch {
         return false
     }
     let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+    task.waitUntilExit()
     let output = String(data: outputData, encoding: .utf8) ?? ""
     return output.contains("--extensionDevelopmentPath")
 }

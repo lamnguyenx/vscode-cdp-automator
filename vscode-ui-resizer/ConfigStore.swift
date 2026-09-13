@@ -24,6 +24,48 @@ let ZOOM_LEVEL_KEY = "window.zoomLevel"
 let CODESERVER_PORT = 9222
 let AX_TIMEOUT: Float = 3.0
 
+// MARK: - CDP Config Key Helpers
+
+let CDP_KEY_SEPARATOR = "-cdp_"
+
+func cdpConfigKey(bundleID: String, port: Int) -> String {
+    return "\(bundleID)\(CDP_KEY_SEPARATOR)\(port)"
+}
+
+func bundleIDForCDPPort(_ port: Int) -> String? {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+    proc.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN"]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = FileHandle.nullDevice
+    do {
+        try proc.run()
+    } catch {
+        return nil
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    proc.waitUntilExit()
+    let output = String(data: data, encoding: .utf8) ?? ""
+    for line in output.split(separator: "\n").dropFirst() {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2, let pid = Int32(parts[1]) else { continue }
+        for app in NSWorkspace.shared.runningApplications where app.processIdentifier == pid {
+            return app.bundleIdentifier
+        }
+    }
+    return nil
+}
+
+func detectCDPKey(for port: Int, fallbackBundle: String = VIVALDI_BUNDLE_ID) -> String {
+    let bid = bundleIDForCDPPort(port) ?? fallbackBundle
+    return cdpConfigKey(bundleID: bid, port: port)
+}
+
+func isCDPKey(_ key: String) -> Bool {
+    return key.contains(CDP_KEY_SEPARATOR)
+}
+
 let EXIT_OK: Int32 = 0
 let EXIT_FAILED: Int32 = 1
 let EXIT_PRECONDITION: Int32 = 2
@@ -214,6 +256,33 @@ func migrateOldFingerprintKeys(_ store: inout [String: DisplayConfig]) {
     }
 }
 
+func migrateToCDPKeys(_ store: inout [String: DisplayConfig]) {
+    let defaultPort = CODESERVER_PORT
+    let defaultKey = detectCDPKey(for: defaultPort)
+    var changed = false
+    var extracted: [String] = []
+
+    for (key, var entry) in store {
+        guard !isCDPKey(key) else { continue }
+        guard entry.vivaldi != nil || entry.codeServerLayout != nil else { continue }
+
+        var cdpEntry = store[defaultKey] ?? DisplayConfig()
+        if let v = entry.vivaldi { cdpEntry.vivaldi = v; entry.vivaldi = nil }
+        if let c = entry.codeServerLayout { cdpEntry.codeServerLayout = c; entry.codeServerLayout = nil }
+        store[defaultKey] = cdpEntry
+        store[key] = entry
+        changed = true
+        extracted.append(key)
+    }
+
+    if changed {
+        fputs("Migrated browser data (vivaldi/code-server) from display-fingerprint to \(defaultKey)\n", stderr)
+        if verboseLogging {
+            for k in extracted { fputs("  extracted from: \(k.prefix(60))...\n", stderr) }
+        }
+    }
+}
+
 func loadConfigStore() -> [String: DisplayConfig] {
     migrateOldJSON()
 
@@ -230,6 +299,7 @@ func loadConfigStore() -> [String: DisplayConfig] {
     }
 
     migrateOldFingerprintKeys(&store)
+    migrateToCDPKeys(&store)
     if !store.isEmpty {
         _ = saveConfigStore(store)
         return store

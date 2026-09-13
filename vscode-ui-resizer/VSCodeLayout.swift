@@ -994,11 +994,11 @@ func cmdSaveCodeServerLayout(port: Int) -> Int32 {
         return EXIT_PRECONDITION
     }
 
-    let fingerPrint = displayFingerprint()
+    let configKey = detectCDPKey(for: port)
     var store = loadConfigStore()
-    var entry = store[fingerPrint] ?? DisplayConfig(window: nil, layout: nil)
+    var entry = store[configKey] ?? DisplayConfig(window: nil, layout: nil)
     entry.codeServerLayout = layout
-    store[fingerPrint] = entry
+    store[configKey] = entry
     guard saveConfigStore(store) else { return EXIT_FAILED }
 
     let sidebar = layout.sidebar?.width ?? 0
@@ -1007,7 +1007,7 @@ func cmdSaveCodeServerLayout(port: Int) -> Int32 {
     let sbPos = layout.sidebar_position ?? "?"
     let pnPos = layout.panel_position ?? "?"
 
-    print("\nSaved code-server \"\(title)\" to \(CONFIG_PATH):")
+    print("\nSaved code-server \"\(title)\" → \(configKey):")
     print("  sidebar:  \(sidebar)px (\(sbPos))")
     print("  panel:    \(panel)px (\(pnPos))")
     print("  editor:   \(editor)px")
@@ -1023,17 +1023,15 @@ func cmdRestoreCodeServerLayout(port: Int) -> Int32 {
         return EXIT_PRECONDITION
     }
 
-    let fingerPrint = displayFingerprint()
-
+    let configKey = detectCDPKey(for: port)
     let layout: LayoutConfig
-    if let match = store[fingerPrint]?.codeServerLayout {
+    if let match = store[configKey]?.codeServerLayout {
         layout = match
     } else if store.count == 1, let only = store.values.first?.codeServerLayout {
-        fputs("No saved code-server layout for current display layout; using the only available saved config.\n", stderr)
-        print("\nCurrent layout:\n\(fingerPrint)\n")
+        fputs("No saved code-server layout for \(configKey); using the only available saved config.\n", stderr)
         layout = only
     } else {
-        fputs("Skipping restore-codeserver-layout: no saved code-server layout for current display layout.\n", stderr)
+        fputs("Skipping restore-codeserver-layout: no saved code-server layout for \(configKey).\n", stderr)
         return EXIT_PRECONDITION
     }
 
@@ -1046,11 +1044,15 @@ func cmdRestoreCodeServerLayout(port: Int) -> Int32 {
         tPanel = layout.panel?.width ?? 0
     }
 
+    let tZoomLevel = layout.zoom_level
+    let tZoomPercent = layout.zoom_percent
+
     guard let targets = tryFetchCodeServerTargets(port: port), !targets.isEmpty else {
         fputs("Skipping restore-codeserver-layout: no code-server tabs found on CDP port \(port).\n", stderr)
         return EXIT_PRECONDITION
     }
-    print("Restoring \(targets.count) code-server tab(s) to sidebar=\(tSidebar)px  panel=\(tPanel)px\n")
+    let dimLabel = (savedPanelPos == "bottom" || savedPanelPos == "top") ? "h" : ""
+    print("Restoring \(targets.count) code-server tab(s) to sidebar=\(tSidebar)px  panel\(dimLabel)=\(tPanel)px\(tZoomPercent.map { "  zoom=\($0)%" } ?? "")\n")
     let tCmd = Date()
 
     let activeBox = Box<String?>(nil)
@@ -1075,6 +1077,72 @@ func cmdRestoreCodeServerLayout(port: Int) -> Int32 {
     activeGroup.wait()
     let activeWSURL = activeBox.value
     print("active-tab detection: \(elapsed(tCmd)) (active=\(activeWSURL == nil ? "none" : "found"))")
+
+    if let zl = tZoomLevel {
+        let targetFactor = pow(1.2, zl)
+        let targetPct = tZoomPercent ?? Int(round(targetFactor * 100))
+        print("Restoring zoom to \(targetPct)% for \(targets.count) tab(s):\n")
+        let zoomQueue = DispatchQueue.global(qos: .userInitiated)
+        let zoomGroup = DispatchGroup()
+        let zoomResults = Box<[Int: String]>([:])
+        let zoomLock = NSLock()
+
+        for (idx, t) in targets.enumerated() {
+            guard let wsUrl = t["webSocketDebuggerUrl"] as? String else { continue }
+            zoomGroup.enter()
+            zoomQueue.async {
+                defer { zoomGroup.leave() }
+                let title = (t["title"] as? String) ?? "unknown"
+                guard let task = newWebSocket(wsUrl) else { return }
+                defer { task.cancel(with: .normalClosure, reason: nil) }
+
+                let currentFactor = readZoomFactor(task) ?? 1.0
+                let steps = Int(round(log(targetFactor / currentFactor) / log(1.2)))
+                guard steps != 0 else {
+                    zoomLock.lock()
+                    zoomResults.value[idx] = "already at \(targetPct)%"
+                    zoomLock.unlock()
+                    return
+                }
+
+                let key = steps > 0 ? "=" : "-"
+                let code = key == "=" ? "Equal" : "Minus"
+                let count = abs(steps)
+                _ = evalJS(task, """
+                (async () => {
+                    const t = document.querySelector('.monaco-workbench') || document;
+                    const k = '\(key)';
+                    const c = '\(code)';
+                    const m = navigator.platform.includes('Mac') ? 'metaKey' : 'ctrlKey';
+                    for (let i = 0; i < \(count); i++) {
+                        t.dispatchEvent(new KeyboardEvent('keydown', { key: k, code: c, [m]: true, bubbles: true }));
+                        t.dispatchEvent(new KeyboardEvent('keyup',   { key: k, code: c, [m]: true, bubbles: true }));
+                        await new Promise(r => setTimeout(r, 120));
+                    }
+                    return 'ok';
+                })()
+                """)
+
+                Thread.sleep(forTimeInterval: 0.5)
+                var ok = false
+                for _ in 1...3 {
+                    if verifyZoomLevel(task, targetLevel: zl) {
+                        ok = true
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.3)
+                }
+                zoomLock.lock()
+                zoomResults.value[idx] = ok ? "OK" : "FAILED"
+                zoomLock.unlock()
+            }
+        }
+        zoomGroup.wait()
+        for idx in targets.indices {
+            print("[\(idx)] zoom: \(zoomResults.value[idx] ?? "SKIPPED")")
+        }
+        print("")
+    }
 
     for (idx, t) in targets.enumerated() {
         guard let wsUrl = t["webSocketDebuggerUrl"] as? String else { continue }

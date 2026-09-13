@@ -229,18 +229,18 @@ func cmdSaveVivaldi(port: Int) -> Int32 {
         return EXIT_PRECONDITION
     }
 
-    let fingerPrint = displayFingerprint()
+    let configKey = detectCDPKey(for: port)
     var store = loadConfigStore()
-    var entry = store[fingerPrint] ?? DisplayConfig(window: nil, layout: nil)
+    var entry = store[configKey] ?? DisplayConfig(window: nil, layout: nil)
     var v = entry.vivaldi ?? VivaldiConfig()
     if let w = tabBarWidth { v.tabBarWidth = w }
     if let p = tabBarPosition { v.tabBarPosition = p }
     if let wi = winInfo { v.window = wi }
     entry.vivaldi = v
-    store[fingerPrint] = entry
+    store[configKey] = entry
     guard saveConfigStore(store) else { return EXIT_FAILED }
 
-    print("Saved Vivaldi → \(CONFIG_PATH)")
+    print("Saved Vivaldi → \(configKey)")
     if let w = tabBarWidth, let p = tabBarPosition {
         print("  tab bar:  \(w)px (\(p))")
     }
@@ -260,9 +260,9 @@ func cmdRestoreVivaldi(port: Int) -> Int32 {
         return EXIT_PRECONDITION
     }
 
-    guard let (_, entry, _) = lookupDisplayEntry(in: store),
-          let vivaldi = entry.vivaldi else {
-        fputs("Skipping restore-vivaldi: no saved Vivaldi config for current display layout.\n", stderr)
+    let configKey = detectCDPKey(for: port)
+    guard let entry = store[configKey], let vivaldi = entry.vivaldi else {
+        fputs("Skipping restore-vivaldi: no saved Vivaldi config for \(configKey).\n", stderr)
         return EXIT_PRECONDITION
     }
 
@@ -331,17 +331,17 @@ func cmdSaveVivaldiZoom(port: Int) -> Int32 {
         return EXIT_PRECONDITION
     }
 
-    let fingerPrint = displayFingerprint()
+    let configKey = detectCDPKey(for: port)
     var store = loadConfigStore()
-    var entry = store[fingerPrint] ?? DisplayConfig(window: nil, layout: nil)
+    var entry = store[configKey] ?? DisplayConfig(window: nil, layout: nil)
     var v = entry.vivaldi ?? VivaldiConfig()
     v.uiZoom = uiZoom
     v.defaultZoom = defaultZoom
     entry.vivaldi = v
-    store[fingerPrint] = entry
+    store[configKey] = entry
     guard saveConfigStore(store) else { return EXIT_FAILED }
 
-    print("Saved Vivaldi zoom → \(CONFIG_PATH)")
+    print("Saved Vivaldi zoom → \(configKey)")
     print("  UI zoom:      \(Int((uiZoom * 100).rounded()))%")
     print("  default zoom: \(Int((defaultZoom * 100).rounded()))%")
     return EXIT_OK
@@ -356,17 +356,15 @@ func cmdRestoreVivaldiZoom(port: Int) -> Int32 {
         return EXIT_PRECONDITION
     }
 
-    let fingerPrint = displayFingerprint()
-
+    let configKey = detectCDPKey(for: port)
     let vivaldi: VivaldiConfig
-    if let match = store[fingerPrint]?.vivaldi {
+    if let match = store[configKey]?.vivaldi {
         vivaldi = match
     } else if store.count == 1, let only = store.values.first?.vivaldi {
-        fputs("No saved Vivaldi config for current display layout; using the only available saved config.\n", stderr)
-        print("\nCurrent layout:\n\(fingerPrint)\n")
+        fputs("No saved Vivaldi config for \(configKey); using the only available saved config.\n", stderr)
         vivaldi = only
     } else {
-        fputs("Skipping restore-vivaldi-zoom: no saved Vivaldi config for current display layout.\n", stderr)
+        fputs("Skipping restore-vivaldi-zoom: no saved Vivaldi config for \(configKey).\n", stderr)
         return EXIT_PRECONDITION
     }
 

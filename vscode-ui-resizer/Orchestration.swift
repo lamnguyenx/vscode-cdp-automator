@@ -16,12 +16,12 @@ func cmdSaveDisplayLayout() -> Int32 {
         fputs("displayplacer not found: \(error)\n", stderr)
         return EXIT_PRECONDITION
     }
+    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     p.waitUntilExit()
     guard p.terminationStatus == 0 else {
         fputs("displayplacer list failed\n", stderr)
         return EXIT_FAILED
     }
-    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
 
     // Verify displayplacer produced output we can parse
     let hasCmd = out.components(separatedBy: "\n").contains { $0.hasPrefix("displayplacer ") }
@@ -118,12 +118,12 @@ func readCurrentDisplays() -> [MonitorEntry] {
     p.standardError = FileHandle.nullDevice
     do {
         try p.run()
-        p.waitUntilExit()
     } catch {
         return []
     }
-    guard p.terminationStatus == 0 else { return [] }
     let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else { return [] }
     return parseDisplayplacerList(out)
 }
 
@@ -251,10 +251,10 @@ func gitRoot() -> String? {
     do {
         try p.run()
     } catch { return nil }
-    p.waitUntilExit()
-    guard p.terminationStatus == 0 else { return nil }
     let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
         .trimmingCharacters(in: .whitespacesAndNewlines)
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else { return nil }
     return (out?.isEmpty == false) ? out : nil
 }
 
